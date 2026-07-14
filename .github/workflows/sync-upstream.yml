@@ -27,18 +27,15 @@ jobs:
         run: |
           git remote add upstream https://github.com/ArcReel/ArcReel.git
           git fetch upstream main
-          # Strategy: merge upstream but never touch our .github/workflows/
-          # 1. Stash our workflow files
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
           mkdir -p /tmp/wf
           cp -r .github/workflows/* /tmp/wf/ 2>/dev/null || true
-          # 2. Merge upstream, prefer upstream on all conflicts
           git merge upstream/main --no-edit -X theirs
-          # 3. Force restore our workflows (discard any upstream workflow changes)
           rm -rf .github/workflows
           mkdir -p .github/workflows
           cp -r /tmp/wf/* .github/workflows/ 2>/dev/null || true
-          # 4. Remove any upstream workflow files we don't want (they'd require workflows permission)
           git add -A
           git commit --amend --no-edit
-          # 5. Push with force-with-lease to avoid stale ref issues
-          git push origin main
+          git push --force-with-lease origin main
