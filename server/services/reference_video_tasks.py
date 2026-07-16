@@ -326,8 +326,8 @@ async def execute_reference_video_task(
     max_refs: int | None = None
     max_duration: int | None = None
     supported_durations: list[int] = []
+    resolver = ConfigResolver(async_session_factory)
     try:
-        resolver = ConfigResolver(async_session_factory)
         caps = await resolver.video_capabilities_for_project(project)
         caps_model = caps.get("model")
         if model_name and caps_model and caps_model != model_name:
@@ -379,12 +379,12 @@ async def execute_reference_video_task(
 
     # resolver key 必须是 registry provider_id（project.video_backend 的 "/" 前半段），
     # 而非 backend.name（如 "gemini"）——与 generation_tasks.execute_video_task 保持一致。
-    from server.services.resolution_resolver import get_provider_fallback, resolve_resolution
+    from lib.config.resolver import get_provider_fallback
 
     video_backend_raw = project.get("video_backend") or ""
     registry_provider_id = video_backend_raw.split("/", 1)[0] if "/" in video_backend_raw else provider_name
 
-    resolution = await resolve_resolution(project, registry_provider_id or provider_name, model_name or "")
+    resolution = await resolver.resolve_resolution(project, registry_provider_id or provider_name, model_name or "")
     if resolution is None:
         resolution = get_provider_fallback(provider_name)
 
