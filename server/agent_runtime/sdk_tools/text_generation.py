@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -30,11 +31,12 @@ from lib.episode_paths import (
 from lib.json_io import atomic_write_json
 from lib.project_manager import DEFAULT_SOURCE_KIND, effective_mode
 from lib.prompt_builders_reference import build_reference_units_split_prompt
-from lib.prompt_builders_script import build_normalize_prompt
+from lib.prompt_builders_script import build_narration_split_prompt, build_normalize_prompt
 from lib.reference_video.shot_parser import extract_mentions, resolve_references
 from lib.script_generator import ScriptGenerator
 from lib.script_models import (
     REFERENCE_SHOT_DURATION_RANGE,
+    NarrationStep1Draft,
     build_drama_normalized_script_model,
     build_reference_units_step1_model,
 )
@@ -627,10 +629,203 @@ def split_reference_video_units_tool(ctx: ToolContext):
     return _handler
 
 
+# ---------------------------------------------------------------------------
+# split_narration_segments
+# ---------------------------------------------------------------------------
+
+
+def _validate_narration_segments(segments: list[dict], supported_durations: list[int]) -> None:
+    """按 narration step1 读取契约做后校验：segment_id 唯一 + novel_text 非空白 + duration ∈ supported_durations。
+
+    静态 ``NarrationStep1Segment.novel_text`` 的 ``min_length=1`` 只校验原始字符串长度，纯空白
+    （如单个空格）能满足该约束却不携带任何实际旁白内容；此类片段在覆盖校验中经
+    ``_normalize_for_coverage`` 折叠为空字符串后不消耗任何字符，不会被覆盖校验拦截，会被当作
+    合法片段（携带真实 duration_seconds / 资产引用）写盘，产生"有时长但无旁白"的哑片段。
+
+    静态 ``NarrationStep1Segment.duration_seconds`` 是 ``ge=1, le=60`` 开区间（复用既有片段 schema，
+    不在 schema 层枚举硬约束），故超出 ``supported_durations`` 的时长能过 schema 校验；此处 fail-loud
+    补上成员校验，与 ``ScriptGenerator._load_narration_step1`` 同口径——只有经此校验的内容才写盘成为
+    step1 真值源，杜绝把非法时长拖到 step2 / 最终 save_script 才暴露。
+    """
+    ids = [s.get("segment_id") for s in segments]
+    dupes = sorted(str(sid) for sid, count in Counter(ids).items() if count > 1)
+    if dupes:
+        raise ValueError(f"step1 拆分内容 segment_id 重复: {dupes}")
+    blank = sorted(str(s.get("segment_id")) for s in segments if not str(s.get("novel_text") or "").strip())
+    if blank:
+        raise ValueError(f"step1 拆分内容 novel_text 为空白: {blank}")
+    allowed = {int(d) for d in supported_durations}
+    bad = sorted({s["duration_seconds"] for s in segments if int(s.get("duration_seconds") or 0) not in allowed})
+    if bad:
+        raise ValueError(f"step1 拆分内容 duration_seconds 非法（不在 {sorted(allowed)} 内）: {bad}")
+
+
+def _validate_narration_asset_references(
+    segments: list[dict],
+    characters: dict[str, Any],
+    scenes: dict[str, Any],
+    props: dict[str, Any],
+) -> None:
+    """校验片段登记的角色 / 场景 / 道具已在 project.json 对应表注册，与 rv 侧
+    ``_derive_and_validate_reference_units`` 对资产引用的校验同口径：只信登记过的资产名，
+    不允许模型发明或拼错的名称被当真值写盘、被 step2 视觉层只读消费。
+    """
+    missing: dict[str, list[str]] = {}
+    for segment in segments:
+        sid = str(segment.get("segment_id"))
+        for field, bucket in (
+            ("characters_in_segment", characters),
+            ("scenes", scenes),
+            ("props", props),
+        ):
+            names = segment.get(field) or []
+            bad = sorted({str(name) for name in names if name not in bucket})
+            if bad:
+                missing[f"{sid}.{field}"] = bad
+    if missing:
+        raise ValueError(f"step1 拆分内容引用了未登记的资产名: {missing}；资产名必须逐字取自 project.json 三张表")
+
+
+def _normalize_for_coverage(text: str) -> str:
+    """把连续空白折叠为单个空格，不删除空白本身，仅消除空白的类型 / 数量差异。"""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _validate_narration_novel_text_coverage(segments: list[dict], novel_text: str) -> None:
+    """机械校验片段 ``novel_text`` 按序、完整覆盖源文，杜绝模型删减 / 改写 / 重排后仍被当真值落盘。
+
+    片段边界处的空白存在与否天然歧义——模型选择的切分点可能落在源文空格上（该空格被
+    切分本身"消耗"，不落在任一片段自身文本里），也可能落在无空格的 CJK / 标点邻接处，
+    两者从拼接后的字符串本身无法可靠区分。因此仅在片段交界处允许可选的单个空格；片段
+    自身文本内部与源文其余部分一律要求折叠后逐字相等，不能让边界宽容掩盖片段内部真实的
+    删减、改写或词间空格丢失（后者是 CJK / 半角标点邻接边界的普适宽容规则曾误伤的场景）。
+    """
+    parts = [re.escape(_normalize_for_coverage(str(s.get("novel_text") or ""))) for s in segments]
+    pattern = " ?".join(parts)
+    if re.fullmatch(pattern, _normalize_for_coverage(novel_text)) is None:
+        raise ValueError("step1 拆分内容 novel_text 未逐字、完整覆盖小说原文（存在删减、改写或重排）")
+
+
+def split_narration_segments_tool(ctx: ToolContext):
+    @tool(
+        "split_narration_segments",
+        "把本集小说原文按朗读节奏拆分为说书片段表（逐字 novel_text + 时长 + segment_break + 出场资产），"
+        "保存到 drafts/episode_N/step1_segments.json，供 generate_episode_script（narration 模式）消费。"
+        "novel_text 逐字保留原文、由 step2 透传，不经 step2 的 LLM 重出。dry_run=true 时仅返回 prompt。",
+        {
+            "type": "object",
+            "properties": {
+                "episode": {"type": "integer", "description": "剧集编号"},
+                "source": {
+                    "type": "string",
+                    "description": "指定小说源文件路径（相对项目目录）；默认读取 source/ 下所有文本",
+                },
+                "dry_run": {"type": "boolean", "description": "仅显示 prompt，不调用模型"},
+            },
+            "required": ["episode"],
+        },
+    )
+    async def _handler(args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            episode = int(args["episode"])
+            source = args.get("source")
+            dry_run = bool(args.get("dry_run"))
+
+            project_path = ctx.project_path
+            project = ctx.pm.load_project(ctx.project_name)
+
+            try:
+                novel_text = _load_novel_source(project_path, source)
+            except ValueError as exc:
+                return {"content": [{"type": "text", "text": f"❌ {exc}"}], "is_error": True}
+
+            characters = project.get("characters")
+            characters = characters if isinstance(characters, dict) else {}
+            scenes = project.get("scenes")
+            scenes = scenes if isinstance(scenes, dict) else {}
+            props = project.get("props")
+            props = props if isinstance(props, dict) else {}
+
+            # narration 仅需 (default_duration, supported_durations)：无 unit 总时长 / references 概念，
+            # 复用与 drama normalize 同口径的 best-effort 能力查询（resolver 故障软回退 [4,6,8]）。
+            default_duration, supported_durations = await _fetch_caps_with_fallback(project)
+            prompt = build_narration_split_prompt(
+                novel_text=novel_text,
+                project_overview=project.get("overview", {}),
+                characters=characters,
+                scenes=scenes,
+                props=props,
+                default_duration=default_duration,
+                supported_durations=supported_durations,
+                episode=episode,
+                # 输出语言取项目 source_language（生成内容语言的唯一真相源），与 normalize / reference 同口径。
+                target_language=project.get("source_language") or "中文",
+            )
+
+            if dry_run:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"DRY RUN — 以下是将发送给文本模型的 Prompt:\n\n{prompt}\n\nPrompt 长度: {len(prompt)} 字符",
+                        }
+                    ]
+                }
+
+            # 结构化输出：response_schema 复用既有 NarrationStep1Draft（片段 schema）；
+            # 本地解析复用同一 schema 保持同口径校验。片段时长的成员约束由下方 _validate_narration_segments 兜底。
+            generator = await TextGenerator.create(TextTaskType.SCRIPT, project_name=ctx.project_name)
+            result = await generator.generate(
+                TextGenerationRequest(
+                    prompt=prompt,
+                    response_schema=NarrationStep1Draft,
+                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                ),
+                project_name=ctx.project_name,
+            )
+            content = _parse_step1_json(
+                result.text, NarrationStep1Draft, label="step1 拆分内容", top_shape="{segments}"
+            )
+
+            raw_segments = content.get("segments")
+            if not isinstance(raw_segments, list) or not raw_segments:
+                raise ValueError("step1 拆分内容结构异常：segments 必须是非空的片段对象数组")
+            _validate_narration_segments(raw_segments, supported_durations)
+            _validate_narration_asset_references(raw_segments, characters, scenes, props)
+            _validate_narration_novel_text_coverage(raw_segments, novel_text)
+
+            drafts_dir = episode_drafts_dir(project_path, episode)
+            drafts_dir.mkdir(parents=True, exist_ok=True)
+            step1_path = drafts_dir / STEP1_FILENAMES["narration"]
+            # step1 真相源须原子写入（同 normalize_drama_script）：避免中断 / 并发重跑留下半写 JSON。
+            atomic_write_json(step1_path, content)
+
+            total_chars = sum(len(str(s.get("novel_text") or "")) for s in raw_segments)
+            total_seconds = sum(int(s.get("duration_seconds") or 0) for s in raw_segments)
+            break_count = sum(1 for s in raw_segments if s.get("segment_break"))
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"✅ 说书片段拆分（结构化 step1）已保存: {step1_path}\n"
+                            f"📊 生成统计: {len(raw_segments)} 个片段 / {total_chars} 字，"
+                            f"预计总时长 {total_seconds} 秒；segment_break 标记 {break_count} 个"
+                        ),
+                    }
+                ]
+            }
+        except Exception as exc:  # noqa: BLE001
+            return tool_error("split_narration_segments", exc)
+
+    return _handler
+
+
 __all__ = [
     "get_video_capabilities_tool",
     "generate_episode_script_tool",
     "confirm_script_review_tool",
     "normalize_drama_script_tool",
     "split_reference_video_units_tool",
+    "split_narration_segments_tool",
 ]
