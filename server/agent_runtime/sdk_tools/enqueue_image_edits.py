@@ -1,4 +1,4 @@
-"""SDK MCP tool for instruction-based image editing (image edit, see ``docs/adr/0049``).
+"""SDK MCP tool for instruction-based image editing (image edit, see ``docs/adr/0050``).
 
 Editing forks the **image**, not the prompt: the current image is the sole reference,
 the user's instruction is the sole prompt, ``image_prompt`` is never rewritten. This is

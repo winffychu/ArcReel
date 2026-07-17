@@ -808,7 +808,7 @@ class ConfigResolver:
         """按任务档位解析文本 backend。
 
         优先级（项目优先）：项目档位 > 项目默认模型 > 全局档位 > 全局默认模型 > 自动推断。
-        任务需要 vision 时校验解析结果的能力，不满足直接报错、不静默换模型（docs/adr/0049）。
+        任务需要 vision 时校验解析结果的能力，不满足直接报错、不静默换模型（docs/adr/0051）。
         """
         async with self._open_session() as (session, svc):
             return await self._resolve_text_backend(svc, session, task_type, project_name)

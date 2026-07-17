@@ -1,4 +1,4 @@
-"""v3→v4 迁移：旧任务级文本 backend 键 → 任务档位键（docs/adr/0049）。
+"""v3→v4 迁移：旧任务级文本 backend 键 → 任务档位键（docs/adr/0051）。
 
 映射：text_backend_script → text_backend_complex；text_backend_overview / text_backend_style
 → text_backend_simple，两者都有值时取 style 的值（style 任务需要 vision，反向会让风格分析

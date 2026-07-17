@@ -15,7 +15,7 @@ drama / narration 剧本走两段式：step1（normalize）把源文整理为 ma
 ## Consequences
 
 - step1 工具契约变更（`normalize_drama_script` 等从「只出 markdown」变为「出结构」）；供人工审阅的中间产物仍在，但由结构渲染、而非自由文本原稿。
-- step1 产出一律由服务端工具（normalize / split）经文本管道生成并落盘（模型来源按 `docs/adr/0049` 的档位解析），subagent 仅编排调用，不在自身上下文里生成内容。
+- step1 产出一律由服务端工具（normalize / split）经文本管道生成并落盘（模型来源按 `docs/adr/0051` 的档位解析），subagent 仅编排调用，不在自身上下文里生成内容。
 - reference_video 的 step2 prompt（`lib/prompt_builders_reference.py`）以结构化 unit 数据为基底组装，不解析自由文本；web 端 step1 预览与编辑按结构渲染。
 - step2（generate-script）prompt / 流程以 step1 确认的结构化数据为唯一基底——完整保留 step1 已定的场景 / 片段边界与 `characters_in_scene` / `scenes` / `props`、`utterances` / `source_text` / `novel_text` 等非视觉字段，仅生成 / 覆盖视觉层（`image_prompt` / `video_prompt`）；移除按 source_kind 重新提取口播的分支。
 - step2 透传以工程手段保真、不靠 prompt 自觉：step2 的 LLM 输出 schema 只含 `scene_id`（对齐锚）+ 视觉字段（`image_prompt` / `video_prompt`），后端按 `scene_id`（非列表顺序）把视觉层合并回 step1 已确认结构、并校验 `scene_id` 唯一与全覆盖；`utterances` / `source_text` 等非视觉字段不进 LLM 输出——从工程上杜绝非视觉字段经 Structured Outputs 漂移，而非靠 prompt 自觉。

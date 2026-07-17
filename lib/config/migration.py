@@ -146,7 +146,7 @@ async def migrate_json_to_db(session: AsyncSession, json_path: Path) -> None:
     logger.info("Migration complete. Renamed to %s", bak_path)
 
 
-# 旧任务级文本 backend 键（按用途逐键配置），已由任务档位键取代（docs/adr/0049）
+# 旧任务级文本 backend 键（按用途逐键配置），已由任务档位键取代（docs/adr/0051）
 _LEGACY_TEXT_TASK_KEYS = ("text_backend_script", "text_backend_overview", "text_backend_style")
 
 

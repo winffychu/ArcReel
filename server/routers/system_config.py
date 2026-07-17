@@ -200,7 +200,7 @@ class SystemConfigPatchRequest(BaseModel):
     claude_code_subagent_model: str | None = None
     agent_session_cleanup_delay_seconds: int | None = None
     agent_max_concurrent_sessions: int | None = None
-    # 文本任务档位（docs/adr/0049）：调用点在代码里固定归档，这里只配置每档的 backend；
+    # 文本任务档位（docs/adr/0051）：调用点在代码里固定归档，这里只配置每档的 backend；
     # 各档未设置回退 default_text_backend。
     text_backend_simple: str | None = None
     text_backend_complex: str | None = None

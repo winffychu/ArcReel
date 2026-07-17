@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { ProviderModelSelect } from "@/components/ui/ProviderModelSelect";
 
-/** 文本任务档位取值（docs/adr/0049）。字段名即档位键：调用点在代码里固定归档，用户只配置每档 backend。 */
+/** 文本任务档位取值（docs/adr/0051）。字段名即档位键：调用点在代码里固定归档，用户只配置每档 backend。 */
 export interface TextTierValue {
   default: string;
   simple: string;

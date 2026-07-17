@@ -127,7 +127,7 @@ export function MediaModelSection() {
   const currentNarrationSpeed =
     "narration_speed" in draft ? draft.narration_speed : settings.narration_speed;
 
-  // 全局文本档位（docs/adr/0049）：全局是解析链基准，各档留空即自动推断（无继承来源）。
+  // 全局文本档位（docs/adr/0051）：全局是解析链基准，各档留空即自动推断（无继承来源）。
   const textTierValue = {
     default: draft.default_text_backend ?? settings.default_text_backend ?? "",
     simple: draft.text_backend_simple ?? settings.text_backend_simple ?? "",

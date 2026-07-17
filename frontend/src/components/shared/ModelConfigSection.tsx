@@ -316,7 +316,7 @@ export function ModelConfigSection({
             providerNames={options.providerNames}
             defaultLabel={t("use_global_default")}
             fallbacks={{
-              // 项目优先解析链（docs/adr/0049）：档位留空时的实际生效值。
+              // 项目优先解析链（docs/adr/0051）：档位留空时的实际生效值。
               // default 档回退全局默认模型；simple/complex 先看本表单的项目默认模型，
               // 再全局对应档，最后全局默认模型。
               default: globalDefaults.textDefault,

@@ -517,7 +517,7 @@ async def edit_image(
     """提交图片指令式编辑任务到队列，立即返回 task_id。
 
     以当前图为唯一参考图、编辑指令为唯一 prompt 走 i2i；新图覆盖 current、旧图自动进
-    版本历史，原 image_prompt 不回写（编辑语义见 ``docs/adr/0049``）。
+    版本历史，原 image_prompt 不回写（编辑语义见 ``docs/adr/0050``）。
     """
     if req.resource_type not in EDITABLE_RESOURCE_TYPES:
         raise BadRequestError("image_edit_resource_type_invalid", resource_type=req.resource_type)

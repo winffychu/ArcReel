@@ -129,7 +129,7 @@ class TextTaskTier(StrEnum):
     """文本任务档位。
 
     调用点在代码里固定归档（见 TEXT_TASK_TIERS），用户只配置「每档用哪个文本 backend」，
-    不配置映射本身（docs/adr/0049）。
+    不配置映射本身（docs/adr/0051）。
     """
 
     SIMPLE = "simple"

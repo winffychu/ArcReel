@@ -388,7 +388,7 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("JSON→DB config migration failed (non-fatal): %s", exc)
 
-    # 旧任务级文本 backend 键 → 档位键（docs/adr/0049）。放在 JSON→DB 迁移之后：
+    # 旧任务级文本 backend 键 → 档位键（docs/adr/0051）。放在 JSON→DB 迁移之后：
     # 旧 JSON 里的同名键经 catch-all 落库后也能被本迁移收编
     try:
         from lib.config.migration import migrate_text_tier_settings

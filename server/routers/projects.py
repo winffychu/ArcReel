@@ -85,7 +85,7 @@ class CreateProjectRequest(BaseModel):
     image_backend: str | None = None
     image_provider_t2i: str | None = None
     image_provider_i2i: str | None = None
-    # 文本任务档位（docs/adr/0049）项目级覆盖 + 项目默认模型；空值 = 继承全局
+    # 文本任务档位（docs/adr/0051）项目级覆盖 + 项目默认模型；空值 = 继承全局
     text_backend_simple: str | None = None
     text_backend_complex: str | None = None
     default_text_backend: str | None = None
@@ -127,7 +127,7 @@ class UpdateProjectRequest(BaseModel):
     audio_backend: str | None = None
     narration_voice: str | None = None
     narration_speed: float | None = None
-    # 文本任务档位（docs/adr/0049）项目级覆盖 + 项目默认模型；空值 = 清除、继承全局
+    # 文本任务档位（docs/adr/0051）项目级覆盖 + 项目默认模型；空值 = 清除、继承全局
     text_backend_simple: str | None = None
     text_backend_complex: str | None = None
     default_text_backend: str | None = None
