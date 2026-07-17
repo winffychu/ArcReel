@@ -225,6 +225,16 @@ export default {
   'voice_style_example': 'Ví dụ: Dịu dàng nhưng uy nghiêm',
   'generate_design': 'Tạo thiết kế',
   'regenerate_design': 'Tạo lại thiết kế',
+
+  // Chỉnh sửa ảnh theo chỉ dẫn
+  'image_edit_action': 'Chỉnh sửa ảnh',
+  'image_edit_no_image_hint': 'Hãy tạo hoặc tải ảnh lên trước rồi mới chỉnh sửa',
+  'image_edit_modal_title': 'Chỉnh sửa ảnh',
+  'image_edit_modal_desc': 'Mô tả trong một câu điều cần thay đổi ở "{{name}}". Chỉ phần đó được điều chỉnh; mọi thứ khác giữ nguyên.',
+  'image_edit_instruction_label': 'Chỉ dẫn chỉnh sửa',
+  'image_edit_instruction_placeholder': 'ví dụ: đổi tóc thành màu đỏ, xóa người qua đường ở hậu cảnh',
+  'image_edit_submit': 'Gửi chỉnh sửa',
+  'image_edit_submitting': 'Đang gửi…',
   'characters_count': 'Nhân vật ({{count}})',
   'scenes': 'Cảnh',
   'props': 'Đạo cụ',
@@ -606,6 +616,7 @@ export default {
   'scene_task_failed': 'Tạo cảnh "{{id}}" thất bại: {{reason}}',
   'prop_task_failed': 'Tạo đạo cụ "{{id}}" thất bại: {{reason}}',
   'grid_task_failed': 'Tạo lưới thất bại: {{reason}}',
+  'image_edit_task_failed': 'Chỉnh sửa "{{id}}" thất bại: {{reason}}',
   'episode_mode_switcher_label': 'Chế độ tạo của tập',
   'episode_mode_inherit_from_project': 'Kế thừa từ dự án',
   'episode_mode_switch_keep_data': "Chuyển chế độ sẽ không xóa các đơn vị / cảnh hiện có — bạn có thể chuyển lại bất cứ lúc nào.",
@@ -1088,9 +1099,11 @@ export default {
   'current_version_badge': 'Hiện tại',
   'switching_version': 'Đang chuyển...',
   'switch_to_version': 'Chuyển sang phiên bản này',
+  'version_restore_busy_hint': 'Đang tạo hoặc chỉnh sửa, chưa thể chuyển phiên bản',
   'version_preview_alt': 'Xem trước phiên bản v{{version}}',
   'version_no_notes': 'Phiên bản này không có ghi chú bổ sung.',
   'version_manual_upload': 'Phiên bản do người dùng tải lên thủ công.',
+  'version_image_edit_badge': 'Đã chỉnh sửa',
 
   // ProjectCard - more actions
   'more_actions': 'Thao tác khác',

@@ -225,6 +225,16 @@ export default {
   'voice_style_example': '例如：温柔但有威严',
   'generate_design': '生成设计图',
   'regenerate_design': '重新生成设计图',
+
+  // 图片指令式编辑
+  'image_edit_action': '编辑图片',
+  'image_edit_no_image_hint': '先生成或上传图片后再编辑',
+  'image_edit_modal_title': '编辑图片',
+  'image_edit_modal_desc': '用一句话描述「{{name}}」要修改的地方，只调整这一处，其余保持不变。',
+  'image_edit_instruction_label': '编辑指令',
+  'image_edit_instruction_placeholder': '例如：把头发改成红色、去掉背景里的路人',
+  'image_edit_submit': '提交编辑',
+  'image_edit_submitting': '提交中…',
   'characters_count': '角色 ({{count}})',
   'scenes': '场景',
   'props': '道具',
@@ -630,6 +640,7 @@ export default {
   'scene_task_failed': '场景 "{{id}}" 生成失败：{{reason}}',
   'prop_task_failed': '道具 "{{id}}" 生成失败：{{reason}}',
   'grid_task_failed': '宫格生成失败：{{reason}}',
+  'image_edit_task_failed': '"{{id}}" 编辑失败：{{reason}}',
   'episode_mode_switcher_label': '集级生成模式',
   'episode_mode_inherit_from_project': '继承项目设置',
   'episode_mode_switch_keep_data': '切换模式不会删除已生成的 units / scenes，可随时切回原模式继续。',
@@ -1118,9 +1129,11 @@ export default {
   'current_version_badge': '当前',
   'switching_version': '切换中...',
   'switch_to_version': '切换到此版本',
+  'version_restore_busy_hint': '生成或编辑进行中，暂无法切换版本',
   'version_preview_alt': '版本 v{{version}} 预览',
   'version_no_notes': '该版本没有记录额外说明。',
   'version_manual_upload': '用户手动上传的版本。',
+  'version_image_edit_badge': '编辑',
 
   // ProjectCard - more actions
   'more_actions': '更多操作',

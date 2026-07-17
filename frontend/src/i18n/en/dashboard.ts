@@ -224,6 +224,16 @@ export default {
   'voice_style_example': 'e.g., Gentle but authoritative',
   'generate_design': 'Generate Design',
   'regenerate_design': 'Regenerate Design',
+
+  // Instruction-based image editing
+  'image_edit_action': 'Edit image',
+  'image_edit_no_image_hint': 'Generate or upload an image first, then edit',
+  'image_edit_modal_title': 'Edit image',
+  'image_edit_modal_desc': 'Describe in one line what to change on "{{name}}". Only that part is adjusted; everything else stays the same.',
+  'image_edit_instruction_label': 'Edit instruction',
+  'image_edit_instruction_placeholder': 'e.g. change the hair to red, remove the passerby in the background',
+  'image_edit_submit': 'Submit edit',
+  'image_edit_submitting': 'Submitting…',
   'characters_count': 'Characters ({{count}})',
   'scenes': 'Scenes',
   'props': 'Props',
@@ -629,6 +639,7 @@ export default {
   'scene_task_failed': 'Scene "{{id}}" generation failed: {{reason}}',
   'prop_task_failed': 'Prop "{{id}}" generation failed: {{reason}}',
   'grid_task_failed': 'Grid generation failed: {{reason}}',
+  'image_edit_task_failed': 'Edit for "{{id}}" failed: {{reason}}',
   'episode_mode_switcher_label': 'Episode generation mode',
   'episode_mode_inherit_from_project': 'Inherit from project',
   'episode_mode_switch_keep_data': "Switching mode won't remove existing units / scenes — you can switch back anytime.",
@@ -1117,9 +1128,11 @@ export default {
   'current_version_badge': 'Current',
   'switching_version': 'Switching...',
   'switch_to_version': 'Switch to this version',
+  'version_restore_busy_hint': 'Generation or editing in progress — version switching is unavailable',
   'version_preview_alt': 'Version v{{version}} preview',
   'version_no_notes': 'No additional notes recorded for this version.',
   'version_manual_upload': 'Manually uploaded by the user.',
+  'version_image_edit_badge': 'Edited',
 
   // ProjectCard - more actions
   'more_actions': 'More Actions',
