@@ -1,3 +1,4 @@
+import json
 import re
 import shutil
 from contextlib import contextmanager
@@ -7,7 +8,10 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from lib.i18n.zh import errors as zh_errors
+from lib.project_manager import EmptySourceError
 from server.auth import CurrentUserInfo, get_current_user
+from server.error_handlers import register_error_handlers
 from server.routers import projects
 
 
@@ -51,12 +55,18 @@ class _FakePM:
         (self.base / "ready" / "storyboards" / "scene_E1S01.png").write_bytes(b"png")
         (self.base / "empty").mkdir(parents=True, exist_ok=True)
         (self.base / "remove-me").mkdir(parents=True, exist_ok=True)
+        # generate_overview 的名义分支目标：存在但内容有问题的项目（源目录空/供应商未配置/json 损坏）
+        (self.base / "bad").mkdir(parents=True, exist_ok=True)
+        (self.base / "no-provider").mkdir(parents=True, exist_ok=True)
+        (self.base / "corrupted").mkdir(parents=True, exist_ok=True)
+        # 上传后概览生成失败的软降级路径：项目存在，但 generate_overview 抛带路径异常
+        (self.base / "leaky").mkdir(parents=True, exist_ok=True)
 
     def list_projects(self):
         return ["ready", "empty", "broken"]
 
     def project_exists(self, name):
-        return name in {"ready", "broken"}
+        return name in {"ready", "broken", "leaky"}
 
     def load_project(self, name):
         if name == "broken":
@@ -66,6 +76,8 @@ class _FakePM:
         return self.project_data[name]
 
     def get_project_path(self, name):
+        if name == "illegal-name":
+            raise ValueError(f"非法项目名称: '{name}'")
         path = self.base / name
         if not path.exists():
             raise FileNotFoundError(name)
@@ -186,7 +198,17 @@ class _FakePM:
     async def generate_overview(self, name):
         if name == "ready":
             return {"synopsis": "generated"}
-        raise ValueError("source missing")
+        if name == "leaky":
+            # 模拟底层异常文本携带服务器绝对路径（如文件读写失败），
+            # 上传端点的软降级分支不得把裸 str(e) 透传给客户端。
+            raise RuntimeError("open failed: /Users/secret/projects/leaky/source/novel.txt")
+        if name == "no-provider":
+            raise ValueError("未找到可用的 text 供应商")
+        if name == "corrupted":
+            # 模拟供应商解析链路内部重新 load_project 时命中损坏的 project.json：
+            # JSONDecodeError 是 ValueError 子类，不该被误判为「未配置供应商」
+            json.loads("{not valid json")
+        raise EmptySourceError("source missing")
 
 
 class _FakeCalc:
@@ -223,6 +245,7 @@ def _client(monkeypatch, fake_pm, fake_calc):
     app = FastAPI()
     app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
     app.include_router(projects.router, prefix="/api/v1")
+    register_error_handlers(app)
     return TestClient(app)
 
 
@@ -644,6 +667,12 @@ class TestProjectsRouter:
 
             gen_overview_bad = client.post("/api/v1/projects/bad/generate-overview")
             assert gen_overview_bad.status_code == 400
+            assert "源目录为空" in gen_overview_bad.json()["detail"]
+
+            # 供应商未配置属另一类原因，与「源目录为空」区分（各自映射独立 i18n key）
+            gen_overview_no_provider = client.post("/api/v1/projects/no-provider/generate-overview")
+            assert gen_overview_no_provider.status_code == 400
+            assert "配置文本供应商" in gen_overview_no_provider.json()["detail"]
 
             update_overview = client.patch(
                 "/api/v1/projects/ready/overview",
@@ -1623,6 +1652,27 @@ class TestUnexpectedErrorsDoNotLeak:
             assert resp.status_code == 500
             assert sentinel not in self._body(resp)
 
+    def test_set_project_source_overview_error_does_not_leak_path(self, tmp_path, monkeypatch):
+        # 概览生成是上传的可选后续：失败时上传仍成功（200），错误只降级回传 overview_error。
+        # 底层异常文本可能携带服务器绝对路径，该分支不得把裸 str(e) 透传给客户端。
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.post(
+                "/api/v1/projects/leaky/source",
+                data={"content": "正文", "generate_overview": "true"},
+            )
+            assert resp.status_code == 200
+            payload = resp.json()
+            assert payload["success"] is True
+            assert payload["overview"] is None
+            # 上传成功后合法回传的 filename 是 novel.txt，不在泄漏范畴；
+            # 泄漏关注的是异常文本携带的服务器绝对路径片段。
+            assert "/Users" not in resp.text
+            assert "/var" not in resp.text
+            assert "/secret/" not in resp.text
+            # 回传的是翻译后的通用文案，而非裸异常串
+            assert payload["overview_error"] == zh_errors.MESSAGES["overview_generation_failed"]
+
     def test_generate_overview_unexpected_error_maps_to_500(self, tmp_path, monkeypatch):
         sentinel = "LEAKED_SECRET_generate_overview"
         client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
@@ -1631,6 +1681,25 @@ class TestUnexpectedErrorsDoNotLeak:
             resp = client.post("/api/v1/projects/ready/generate-overview")
             assert resp.status_code == 500
             assert sentinel not in self._body(resp)
+
+    def test_generate_overview_corrupted_project_maps_to_500_not_provider_error(self, tmp_path, monkeypatch):
+        # JSONDecodeError 是 ValueError 子类：损坏的 project.json 不能被 except ValueError
+        # 误判为「未配置文本供应商」，须先于其拦截并映射为通用 500
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.post("/api/v1/projects/corrupted/generate-overview")
+            assert resp.status_code == 500
+            assert "配置文本供应商" not in self._body(resp)
+
+    def test_generate_overview_invalid_project_name_maps_to_400_not_provider_error(self, tmp_path, monkeypatch):
+        # get_project_path 抛出的非法项目名 ValueError（路径穿越等）不能被 generate_overview()
+        # 内部供应商解析链路的 except ValueError 误判为「未配置文本供应商」
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.post("/api/v1/projects/illegal-name/generate-overview")
+            assert resp.status_code == 400
+            assert "配置文本供应商" not in self._body(resp)
+            assert "illegal-name" in self._body(resp)
 
     def test_update_overview_unexpected_error_maps_to_500(self, tmp_path, monkeypatch):
         sentinel = "LEAKED_SECRET_update_overview"
