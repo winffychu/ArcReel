@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from lib import PROJECT_ROOT
 from lib.api_errors import BadRequestError, ConflictError, ServiceUnavailableError
 from lib.i18n import Translator, get_locale
+from server.agent_runtime.failure_observation import build_startup_failure_observation
 from server.agent_runtime.models import SessionMeta
 from server.agent_runtime.service import AssistantService
 from server.agent_runtime.session_manager import AgentStartupError, SessionBusyError, SessionCapacityError
@@ -27,6 +28,24 @@ assistant_service = AssistantService(project_root=PROJECT_ROOT)
 
 def get_assistant_service() -> AssistantService:
     return assistant_service
+
+
+def agent_startup_failure_detail(
+    exc: AgentStartupError,
+    *,
+    project_name: str,
+    session_id: str | None,
+    title: str,
+) -> dict:
+    """把 runtime 启动异常映射为两个 Agent API 共用的结构化错误。"""
+    original = exc.__cause__ or exc
+    failure = exc.failure_observation or build_startup_failure_observation(
+        original,
+        project_name=project_name,
+        session_id=session_id,
+        sdk_stderr=exc.sdk_stderr,
+    )
+    return {"code": "agent_startup_failed", "message": title, "failure": failure}
 
 
 async def _validate_session_ownership(
@@ -103,7 +122,12 @@ async def send_message(
     except AgentStartupError as exc:
         raise HTTPException(
             status_code=502,
-            detail=_t("agent_startup_failed", details=str(exc)),
+            detail=agent_startup_failure_detail(
+                exc,
+                project_name=project_name,
+                session_id=req.session_id,
+                title=_t("agent_startup_failed_title"),
+            ),
         )
     except Exception:
         logger.exception("请求处理失败")
@@ -226,6 +250,15 @@ async def stream_entries(
             yield event
     except HTTPException:
         raise
+    except AgentStartupError as exc:
+        detail = agent_startup_failure_detail(
+            exc,
+            project_name=project_name,
+            session_id=session_id,
+            title=_t("agent_startup_failed_title"),
+        )
+        async for event in service.stream_startup_failure_events(session_id, detail["failure"]):
+            yield event
     except Exception:
         logger.exception("请求处理失败")
         raise HTTPException(status_code=500, detail=_t("internal_server_error"))
