@@ -10,20 +10,28 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import AfterValidator, BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.api_errors import BadRequestError
 from lib.config.repository import mask_secret
 from lib.custom_provider import make_provider_id
+from lib.custom_provider.capabilities import (
+    CAPABILITY_OVERRIDE_FIELDS,
+    capability_value_matches,
+    filter_valid_overrides,
+    system_video_capabilities,
+)
 from lib.custom_provider.endpoints import (
     ENDPOINT_REGISTRY,
     endpoint_spec_to_dict,
     endpoint_to_image_capabilities,
     endpoint_to_media_type,
+    get_endpoint_spec,
 )
 from lib.db import get_async_session
 from lib.db.base import dt_to_iso
@@ -47,6 +55,18 @@ DiscoveryFormatLiteral = Literal["openai", "google"]
 
 # 并发上限定型字段：可空正整数（≥1）；None = 未设置 → 容量装载回退全局默认。
 MaxWorkers = Annotated[int | None, Field(default=None, ge=1)]
+
+# 开放给用户覆盖的能力维度。DB 列与合成函数对 VideoCapabilities 全字段通用，写入侧在此收窄：
+# 未列入的维度即便是合法字段名也不落库，扩容只需往这里加键名，无需 DB 迁移或改合成语义。
+CAPABILITY_OVERRIDE_ALLOWLIST = frozenset({"last_frame"})
+
+# 白名单必须是 VideoCapabilities 字段名的子集：值类型校验直接按字段名取期望类型，键名写错
+# 要在导入期炸掉，而不是等到一次真实写入才 KeyError 成 500。
+if not CAPABILITY_OVERRIDE_ALLOWLIST <= CAPABILITY_OVERRIDE_FIELDS.keys():
+    raise RuntimeError(
+        f"能力覆盖白名单含非 VideoCapabilities 字段: "
+        f"{sorted(CAPABILITY_OVERRIDE_ALLOWLIST - set(CAPABILITY_OVERRIDE_FIELDS))}"
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +115,26 @@ class ModelInput(BaseModel):
     currency: str | None = None
     supported_durations: list[int] | None = None
     resolution: str | None = None
+    # 稀疏覆盖字典，键名对齐 VideoCapabilities 字段名；None 或键缺席 = 跟随系统判定。
+    # 保存模型列表是整体替换语义，本字段必须随列表回传，否则存量覆盖被清空。
+    capability_overrides: dict[str, object] | None = None
+
+    @field_validator("capability_overrides")
+    @classmethod
+    def _keep_open_capabilities_only(cls, value: dict[str, object] | None) -> dict[str, object] | None:
+        """静默剔除开放白名单外的覆盖键，空字典收敛为 None。
+
+        白名单外的键只能由手工改库产生：界面既不显示也没有入口能删，写入侧若为此报错，用户
+        会被堵在一个自己无法处置的 422 上，连改显示名都保存不了。剔除即这类键的唯一出口，
+        落库的覆盖字典因此只含当前开放的维度。剔除对用户静默，但落一条 warning：这是数据被
+        丢弃的唯一痕迹，运维排查"我改的库值怎么没了"时需要它。
+        """
+        if not value:
+            return None
+        kept = {k: v for k, v in value.items() if k in CAPABILITY_OVERRIDE_ALLOWLIST}
+        if dropped := sorted(value.keys() - kept.keys()):
+            logger.warning("能力覆盖含未开放键，保存时已剔除: %s", ", ".join(dropped))
+        return kept or None
 
     def to_db_dict(self) -> dict:
         """返回适合写入数据库的字典（supported_durations 序列化为 JSON 字符串）。
@@ -173,6 +213,10 @@ class ModelResponse(BaseModel):
     currency: str | None = None
     supported_durations: list[int] | None = None
     resolution: str | None = None
+    # 系统判定值（四字段全量），video endpoint 才有；非 video 或 endpoint 声明异常时为 None。
+    system_capabilities: dict[str, object] | None = None
+    # 用户覆盖（稀疏字典），与 system_capabilities 平凡合并即为生效值。
+    capability_overrides: dict[str, object] | None = None
 
 
 class ProviderResponse(BaseModel):
@@ -218,6 +262,9 @@ class EndpointDescriptor(BaseModel):
     request_method: str
     request_path_template: str
     image_capabilities: list[str] | None = None  # image 类填能力字符串列表，其他为 None
+    # 该 endpoint 的执行层是否真的下传尾帧约束；仅 video 类有意义。前端据此收窄 last_frame
+    # 覆盖控件里「强制开」的可选范围——否则用户只能撞上写入侧的 422 才知道这条路不通。
+    end_image_capable: bool = False
 
 
 class EndpointCatalogResponse(BaseModel):
@@ -229,9 +276,39 @@ class EndpointCatalogResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _system_capabilities_for(endpoint: str, model_id: str) -> dict[str, object] | None:
+    """读该 model 的系统判定能力（四字段全量）；非 video endpoint 返回 None。
+
+    判定失败（endpoint 已下线、注册表声明异常）时降级为 None 而非 500：列表端点要能把
+    其余模型正常呈现出来，单行判定不出来只是设置页少一段"判定值"提示。
+    """
+    try:
+        if endpoint_to_media_type(endpoint) != "video":
+            return None
+        return asdict(system_video_capabilities(endpoint=endpoint, model_id=model_id))
+    except ValueError:
+        logger.warning("无法判定系统能力: endpoint=%r model_id=%r", endpoint, model_id)
+        return None
+
+
+def _effective_overrides_for_response(
+    endpoint: str, model_id: str, overrides: object | None
+) -> dict[str, object] | None:
+    """回显前按写入侧同一判定过滤，剔除执行层不会采用的键值。
+
+    存量行 / 非 API 写入可能留下已不兼容的覆盖（如 endpoint 不再 end_image_capable 后的
+    last_frame=True）：原样回显会让界面显示"覆盖已生效"，但执行层其实静默忽略；且客户端
+    普通保存时把它原样回传，会被写入侧白名单拒为 422，堵住与该覆盖无关的编辑。
+    """
+    filtered = filter_valid_overrides(endpoint=endpoint, model_id=model_id, overrides=overrides)
+    return filtered or None
+
+
 def _model_to_response(m) -> ModelResponse:
     durations = json.loads(m.supported_durations) if m.supported_durations else None
     return ModelResponse(
+        system_capabilities=_system_capabilities_for(m.endpoint, m.model_id),
+        capability_overrides=_effective_overrides_for_response(m.endpoint, m.model_id, m.capability_overrides),
         id=m.id,
         model_id=m.model_id,
         display_name=m.display_name,
@@ -295,6 +372,63 @@ def _check_duplicate_model_ids(models: list[ModelInput], _t: Callable[..., str])
             raise HTTPException(status_code=422, detail=_t("duplicate_model_id", model_id=m.model_id))
         if m.model_id:
             seen.add(m.model_id)
+
+
+def _check_capability_overrides(
+    overrides: dict[str, object] | None,
+    endpoint: str,
+    model_id: str,
+    _t: Callable[..., str],
+) -> None:
+    """写入侧校验：合成函数对脏值只降级不抛，合法性把关全在这里。
+
+    None 与空字典都表示"全部跟随系统判定"，一律放行。键集合已由 ``ModelInput`` 收窄到开放
+    白名单内，此处校验其余维度：非空覆盖要求 endpoint 为 video 类，值类型与该能力字段一致。
+    """
+    if not overrides:
+        return
+    if endpoint_to_media_type(endpoint) != "video":
+        raise HTTPException(
+            status_code=422,
+            detail=_t("capability_overrides_video_only", model_id=model_id, endpoint=endpoint),
+        )
+    for key, value in overrides.items():
+        expected = CAPABILITY_OVERRIDE_FIELDS[key]
+        # 值类型判定复用合成层的同一函数：两边各写一份会漂移，届时写入侧放行的值被合成
+        # 静默忽略，正是本能力覆盖链路要消灭的「界面允许、执行反悔」。
+        if not capability_value_matches(value, expected):
+            raise HTTPException(
+                status_code=422,
+                detail=_t(
+                    "capability_override_invalid_value",
+                    model_id=model_id,
+                    capability=key,
+                    expected=expected.__name__,
+                ),
+            )
+        # last_frame 覆盖为 True 时，endpoint 的 delegate.generate() 必须真的会读取
+        # end_image 下传尾帧约束——否则覆盖只是让合成层宣称支持，执行层仍静默生成无约束视频。
+        if key == "last_frame" and value is True and not get_endpoint_spec(endpoint).end_image_capable:
+            raise HTTPException(
+                status_code=422,
+                detail=_t(
+                    "capability_override_last_frame_unsupported",
+                    model_id=model_id,
+                    endpoint=endpoint,
+                ),
+            )
+
+
+def _check_model_capability_overrides(models: list[ModelInput], _t: Callable[..., str]) -> None:
+    """对整批模型逐个跑覆盖校验（保存模型列表的写入路径，设置页表单的覆盖编辑也走这里）。
+
+    每行都按提交上来的 ``(endpoint, 覆盖值)`` 校验：覆盖是否合法随 endpoint 变化
+    （last_frame=True 要求 endpoint 的 end_image_capable，非 video endpoint 直接拒绝非空覆盖），
+    故覆盖字典原样不动、只切 endpoint 的整表 PUT 同样要按新 endpoint 重新判定。开放白名单外的
+    键不会走到这里——``ModelInput`` 已在解析期把它们剔除。
+    """
+    for m in models:
+        _check_capability_overrides(m.capability_overrides, m.endpoint, m.model_id, _t)
 
 
 def _check_unique_defaults(models: list[ModelInput], _t: Callable[..., str]) -> None:
@@ -390,6 +524,7 @@ async def create_provider(
     if body.models:
         _check_duplicate_model_ids(body.models, _t)
         _check_unique_defaults(body.models, _t)
+        _check_model_capability_overrides(body.models, _t)
     repo = CustomProviderRepository(session)
     model_dicts = [m.to_db_dict() for m in body.models] if body.models else None
     provider = await repo.create_provider(
@@ -492,6 +627,7 @@ async def full_update_provider(
     """原子更新供应商元数据 + 模型列表（单一事务）。"""
     _check_duplicate_model_ids(body.models, _t)
     _check_unique_defaults(body.models, _t)
+    _check_model_capability_overrides(body.models, _t)
     repo = CustomProviderRepository(session)
     kwargs: dict = {
         "display_name": body.display_name,
@@ -561,13 +697,13 @@ async def replace_models(
     """替换供应商的整个模型列表。"""
     _check_duplicate_model_ids(body.models, _t)
     _check_unique_defaults(body.models, _t)
+    _check_model_capability_overrides(body.models, _t)
     repo = CustomProviderRepository(session)
     provider = await repo.get_provider(provider_id)
     if provider is None:
         raise HTTPException(status_code=404, detail=_t("provider_not_found"))
     # 记录旧模型 ID，用于清理悬空引用
-    old_models = await repo.list_models(provider_id)
-    old_model_ids = {m.model_id for m in old_models}
+    old_model_ids = {m.model_id for m in await repo.list_models(provider_id)}
     new_model_ids = {m.model_id for m in body.models}
     deleted_model_ids = old_model_ids - new_model_ids
 

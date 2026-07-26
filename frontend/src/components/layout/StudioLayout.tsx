@@ -11,6 +11,10 @@ import { useProjectEventsSSE } from "@/hooks/useProjectEventsSSE";
 import { TaskFailureListener } from "./TaskFailureListener";
 import { ScriptGenerationNoticeListener } from "./ScriptGenerationNoticeListener";
 import { useProjectsStore } from "@/stores/projects-store";
+import { DemoAssistantPanel } from "@/onboarding/DemoAssistantPanel";
+import { DemoReadOnlyBanner } from "@/onboarding/DemoReadOnlyBanner";
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import { isDemoProject } from "@/onboarding/demo-project";
 import {
   ASSISTANT_PANEL_DEFAULT_WIDTH,
   clampAssistantPanelWidth,
@@ -29,6 +33,8 @@ export function StudioLayout({ children }: StudioLayoutProps) {
   const { t } = useTranslation("dashboard");
   const [, setLocation] = useLocation();
   const currentProjectName = useProjectsStore((s) => s.currentProjectName);
+  // 演示项目在后端不存在：任务 / 项目事件流和助手都是真实写路径，演示态下整条都不接
+  const demoMode = useDemoWorkbench();
   const assistantPanelOpen = useAppStore((s) => s.assistantPanelOpen);
   const toggleAssistantPanel = useAppStore((s) => s.toggleAssistantPanel);
   const assistantPanelWidth = useAppStore((s) => s.assistantPanelWidth);
@@ -56,8 +62,14 @@ export function StudioLayout({ children }: StudioLayoutProps) {
     setDraftWidth(next);
   }, []);
 
-  useTasksSSE(currentProjectName);
-  useProjectEventsSSE(currentProjectName);
+  // demoMode 演示→真实切换时先于 store 变为 false，currentProjectName 单独判一次
+  // 兜住这一帧仍读到旧演示项目名的窗口，避免对不存在的演示项目建一次必然失败的 SSE 连接。
+  // useTasksSSE 的 projectName=null 语义是「不按项目过滤」而非「停用」，enabled 必须
+  // 同步这一判定，否则该帧会退化成对全局任务的轮询而非真正停用。
+  const isEffectivelyDemo = demoMode || isDemoProject(currentProjectName);
+  const sseProjectName = isEffectivelyDemo ? null : currentProjectName;
+  useTasksSSE(sseProjectName, !isEffectivelyDemo);
+  useProjectEventsSSE(sseProjectName);
 
   const restoreBodyStyle = useCallback(() => {
     const saved = restoreBodyStyleRef.current;
@@ -147,14 +159,32 @@ export function StudioLayout({ children }: StudioLayoutProps) {
       className="flex h-screen flex-col"
       style={{ color: "var(--color-text)" }}
     >
-      <TaskFailureListener projectName={currentProjectName} />
+      <TaskFailureListener projectName={sseProjectName} />
       <ScriptGenerationNoticeListener />
       <GlobalHeader onNavigateBack={() => setLocation("~/app/projects")} />
+      {demoMode ? <DemoReadOnlyBanner /> : null}
       <div className="flex flex-1 overflow-hidden">
         <AssetSidebar />
         <main className="flex-1 overflow-hidden">
           {children}
         </main>
+        {/* 真实助手是写路径（建会话、跑工具），演示态下换成静态演示对话的面板：
+            不可收起、不可拖宽——演示里没有要腾的空间，少两个交互点。宽度封顶在默认宽度
+            但随视口收缩：真实面板窄屏下还能手动收起，演示面板收不起来，引导期间底层又是
+            inert 的，固定 505px 会把工作区挤没，后面几步就没东西可看了 */}
+        {demoMode ? (
+          <div
+            className="shrink-0 overflow-hidden"
+            style={{
+              width: `min(${ASSISTANT_PANEL_DEFAULT_WIDTH}px, 40vw)`,
+              minWidth: 0,
+              background: "oklch(0.19 0.011 250 / 0.5)",
+              borderLeft: "1px solid var(--color-hairline)",
+            }}
+          >
+            <DemoAssistantPanel />
+          </div>
+        ) : (
         <div
           className={`relative shrink-0 overflow-hidden ${
             isResizing
@@ -190,9 +220,11 @@ export function StudioLayout({ children }: StudioLayoutProps) {
             <AgentCopilot />
           </div>
         </div>
+        )}
       </div>
 
       {/* 悬浮助手球：收起时显示在右上角 */}
+      {demoMode ? null : (
       <button
         type="button"
         onClick={toggleAssistantPanel}
@@ -217,6 +249,7 @@ export function StudioLayout({ children }: StudioLayoutProps) {
       >
         <Bot className="h-5 w-5" />
       </button>
+      )}
     </div>
   );
 }

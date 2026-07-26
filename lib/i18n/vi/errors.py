@@ -134,6 +134,16 @@ MESSAGES = {
     "endpoint_media_type_mismatch": "media_type của endpoint không khớp: {detail}",
     "backend_creation_failed": "Tạo backend thất bại: {err_msg}",
     "unsupported_discovery_format": "Kiểm tra kết nối không hỗ trợ với {discovery_format}",
+    "capability_overrides_video_only": (
+        "Endpoint {endpoint} của mô hình {model_id} không phải loại video; không hỗ trợ ghi đè năng lực"
+    ),
+    "capability_override_invalid_value": (
+        "Năng lực {capability} của mô hình {model_id} có kiểu giá trị không hợp lệ; cần {expected}"
+    ),
+    "capability_override_last_frame_unsupported": (
+        "Endpoint {endpoint} của mô hình {model_id} không hỗ trợ tạo khung hình cuối; "
+        "không thể ghi đè last_frame thành true"
+    ),
     # Projects
     "unknown_style_template": "Mẫu phong cách không xác định: {template_id}",
     "ad_only_field": "{field} chỉ khả dụng cho dự án quảng cáo/video ngắn (content_mode=ad)",
@@ -217,6 +227,7 @@ MESSAGES = {
     "video_duration_not_supported": "Thời lượng video {duration}s không nằm trong các thời lượng mà mô hình này hỗ trợ ({supported})",
     "video_capability_missing_t2v": "{provider}/{model} không hỗ trợ text-to-video; hãy cung cấp ảnh khung hình đầu hoặc chuyển sang mô hình có hỗ trợ text-to-video",
     "video_resolution_duration_unsupported": "Mô hình {model} không hỗ trợ {duration}s ở độ phân giải {resolution} (chỉ {supported}); hãy điều chỉnh độ phân giải hoặc thời lượng",
+    "video_reference_images_duration_unsupported": "Mô hình {model} không hỗ trợ {duration}s khi dùng ảnh tham chiếu (chỉ {supported}); hãy đổi thời lượng sang {supported} hoặc bỏ ảnh tham chiếu",
     "video_reference_images_required": "Mô hình {model} cần ít nhất một ảnh tham chiếu; hãy cung cấp ảnh tham chiếu",
     "video_reference_images_unreadable": "Mô hình {model} có ảnh tham chiếu bị thiếu hoặc không đọc được; đã hủy tạo: {names}; hãy kiểm tra đường dẫn ảnh tham chiếu",
     "video_reference_images_unsupported": "Mô hình {model} không hỗ trợ ảnh tham chiếu đa chủ thể; hãy bỏ ảnh tham chiếu hoặc chuyển sang mô hình có hỗ trợ tạo video từ ảnh tham chiếu",
@@ -225,6 +236,8 @@ MESSAGES = {
     "video_start_image_unreadable": "Ảnh khung hình đầu của mô hình {model} không đọc được; đã hủy tạo: {name}; hãy kiểm tra đường dẫn ảnh khung hình đầu",
     "video_end_image_unreadable": "Ảnh khung hình cuối của mô hình {model} không đọc được; đã hủy tạo: {name}; hãy kiểm tra đường dẫn ảnh khung hình cuối",
     "video_end_image_requires_start_image": "Mô hình {model} không hỗ trợ khung hình cuối độc lập; hãy cung cấp thêm khung hình đầu (chế độ khung đầu+cuối) hoặc bỏ khung hình cuối",
+    "video_last_frame_requires_pro": "{provider}/{model} chỉ hỗ trợ khung đầu+cuối ở gói pro; hãy chuyển sang gói pro hoặc bỏ khung hình cuối",
+    "video_last_frame_unsupported": "{provider}/{model} không hỗ trợ khung hình cuối với cấu hình hiện tại; đã hủy tạo. Hãy bỏ khung hình cuối của cảnh quay này, hoặc chuyển sang mô hình hoặc gói có hỗ trợ",
     # Agent credentials
     "agent_preset_unknown": "Nhà cung cấp đặt sẵn không xác định: {preset_id}",
     "agent_base_url_required_custom": "Cấu hình tuỳ chỉnh yêu cầu base_url",

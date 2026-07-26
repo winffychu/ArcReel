@@ -13,6 +13,9 @@ import {
 } from "@/app-routes";
 import { useTranslation } from "react-i18next";
 import { useProjectsStore } from "@/stores/projects-store";
+import { useDemoWorkbench } from "@/onboarding/use-demo-workbench";
+import { isDemoProject } from "@/onboarding/demo-project";
+import { DemoEpisodePlaceholder } from "@/onboarding/DemoEpisodePlaceholder";
 import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
 import { useActiveResourceIds } from "@/stores/tasks-store";
@@ -87,6 +90,9 @@ export function StudioCanvasRouter() {
   tRef.current = t;
   const { currentProjectData, currentProjectName, currentScripts } =
     useProjectsStore();
+  // 演示态：资产画布仍走 readOnly 透传，工作台时间线的只读则由组件自己直读同一判定。
+  // useDemoWorkbench() 已把路由参数与 store 的判定滞后收口在单一来源，此处直接消费。
+  const demoMode = useDemoWorkbench();
 
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [customProviders, setCustomProviders] = useState<CustomProviderInfo[]>([]);
@@ -96,6 +102,9 @@ export function StudioCanvasRouter() {
   >(undefined);
 
   useEffect(() => {
+    // 这三份数据只服务视频时长选项。演示态的时长是虚构的静态展示，唯一还会用到选项的
+    // 是「时长与后端不兼容」的橙色标记——对虚构数据那是伪告警，不值得为它发三个全局请求。
+    if (demoMode) return;
     let disposed = false;
     Promise.all([getProviderModels(), getCustomProviderModels(), API.getSystemConfig()]).then(
       ([provList, customList, configRes]) => {
@@ -106,16 +115,28 @@ export function StudioCanvasRouter() {
       },
     ).catch(() => {});
     return () => { disposed = true; };
-  }, []);
+  }, [demoMode]);
 
   // 已配置 backend 时本地 lookup 即可（同步、零延迟）；未配置时调后端
   // /video-capabilities，让 ConfigResolver 自动 fallback 到 PROVIDER_REGISTRY
   // 第一个 ready 的 default video model（与生成路径用同一套规则，避免 FE/BE 漂移）。
   const localDurationOptions = useMemo(() => {
+    // 演示态即便 state 里还留着上一个真实项目的 providers/backend（同一组件实例原地切入
+    // 演示路由，effect 提前 return 不会清掉旧值），也不参与比对——否则真实后端的时长限制
+    // 会继续套用到演示的虚构时长上，重新触发「不兼容」误报。demoMode 演示→真实切换时先于
+    // store 变为 false，currentProjectName 单独判一次兜住这一帧仍读到旧演示项目名的窗口。
+    if (demoMode || isDemoProject(currentProjectName)) return undefined;
     const backend = currentProjectData?.video_backend || globalVideoBackend;
     if (!backend) return undefined;
     return lookupSupportedDurations(providers, backend, customProviders);
-  }, [providers, customProviders, globalVideoBackend, currentProjectData?.video_backend]);
+  }, [
+    demoMode,
+    currentProjectName,
+    providers,
+    customProviders,
+    globalVideoBackend,
+    currentProjectData?.video_backend,
+  ]);
 
   useEffect(() => {
     // 依赖变化时清理旧的 resolved 选项；本地 lookup 有结果或缺项目名时同步清零，
@@ -125,7 +146,11 @@ export function StudioCanvasRouter() {
       setResolvedDurationOptions(undefined);
       return;
     }
-    if (!currentProjectName) {
+    // 演示项目查不到 /video-capabilities（后端无此项目），时长选项留空即可。
+    // currentProjectName 单独判一次：demo→真实项目切换后路由已使 demoMode 为 false，
+    // 但 store 的 currentProjectName 还没同步完成时仍是演示项目名，只看 demoMode 会
+    // 对着不存在的演示项目发一次必然失败的请求。
+    if (!currentProjectName || demoMode || isDemoProject(currentProjectName)) {
       setResolvedDurationOptions(undefined);
       return;
     }
@@ -143,9 +168,16 @@ export function StudioCanvasRouter() {
     return () => {
       disposed = true;
     };
-  }, [currentProjectName, localDurationOptions]);
+  }, [currentProjectName, localDurationOptions, demoMode]);
 
-  const durationOptions = localDurationOptions ?? resolvedDurationOptions;
+  // demoMode 翻转的同一渲染帧内 localDurationOptions 已同步归零，但 resolvedDurationOptions
+  // 是异步 effect 才清空的旧 state，真实项目切入演示路由的这一帧仍可能读到上一个项目的时长
+  // 能力；显式屏蔽 fallback，避免虚构时长被套用真实后端限制而误报「不兼容」。demoMode 演示→
+  // 真实切换时先于 store 变为 false，currentProjectName 单独判一次兜住同一滞后窗口。
+  const durationOptions =
+    demoMode || isDemoProject(currentProjectName)
+      ? undefined
+      : localDurationOptions ?? resolvedDurationOptions;
 
   // 从任务队列派生 loading 状态（替代本地 state）：活跃 + 最新行胜出两条不变量下沉到 store selector
   const generatingCharacterNames = useActiveResourceIds("character", currentProjectName);
@@ -522,6 +554,7 @@ export function StudioCanvasRouter() {
         <OverviewCanvas
           projectName={currentProjectName}
           projectData={currentProjectData}
+          readOnly={demoMode}
         />
       </Route>
 
@@ -534,13 +567,16 @@ export function StudioCanvasRouter() {
       </Route>
 
       <Route path={`/${WORKSPACE_ROUTE_SOURCE}`}>
-        <SourceFilesPage projectName={currentProjectName} />
+        {/* 演示项目没有源文件、后端也不存在该项目；侧栏已隐藏该入口，这里再兜底直接输入 URL 的情形 */}
+        {demoMode ? <Redirect to="/" /> : <SourceFilesPage projectName={currentProjectName} />}
       </Route>
 
       <Route path={`/${WORKSPACE_ROUTE_CHARACTERS}`}>
         <CharactersPage
+          key={currentProjectName}
           projectName={currentProjectName}
           characters={currentProjectData?.characters ?? {}}
+          readOnly={demoMode}
           onSaveCharacter={handleSaveCharacter}
           onGenerateCharacter={handleGenerateCharacterVoid}
           onAddCharacter={handleAddCharacterSubmit}
@@ -552,8 +588,10 @@ export function StudioCanvasRouter() {
 
       <Route path={`/${WORKSPACE_ROUTE_SCENES}`}>
         <ScenesPage
+          key={currentProjectName}
           projectName={currentProjectName}
           scenes={currentProjectData?.scenes ?? {}}
+          readOnly={demoMode}
           onUpdateScene={handleUpdateSceneVoid}
           onGenerateScene={handleGenerateSceneVoid}
           onAddScene={handleAddSceneSubmit}
@@ -565,8 +603,10 @@ export function StudioCanvasRouter() {
 
       <Route path={`/${WORKSPACE_ROUTE_PROPS}`}>
         <PropsPage
+          key={currentProjectName}
           projectName={currentProjectName}
           props={currentProjectData?.props ?? {}}
+          readOnly={demoMode}
           onUpdateProp={handleUpdatePropVoid}
           onGenerateProp={handleGeneratePropVoid}
           onAddProp={handleAddPropSubmit}
@@ -578,8 +618,10 @@ export function StudioCanvasRouter() {
 
       <Route path={`/${WORKSPACE_ROUTE_PRODUCTS}`}>
         <ProductsPage
+          key={currentProjectName}
           projectName={currentProjectName}
           products={currentProjectData?.products ?? {}}
+          readOnly={demoMode}
           onUpdateProduct={handleUpdateProductVoid}
           onGenerateProduct={handleGenerateProductVoid}
           onAddProduct={handleAddProductSubmit}
@@ -590,12 +632,16 @@ export function StudioCanvasRouter() {
       </Route>
 
       <Route path={`/${WORKSPACE_ROUTE_SOURCE}/:filename`}>
-        {(params) => (
-          <SourceFileViewer
-            projectName={currentProjectName}
-            filename={decodeURIComponent(params.filename)}
-          />
-        )}
+        {(params) =>
+          demoMode ? (
+            <Redirect to="/" />
+          ) : (
+            <SourceFileViewer
+              projectName={currentProjectName}
+              filename={decodeURIComponent(params.filename)}
+            />
+          )
+        }
       </Route>
 
       <Route path={`/${WORKSPACE_ROUTE_EPISODES}/:episodeId`}>
@@ -621,12 +667,16 @@ export function StudioCanvasRouter() {
           // 已选集但剧本未生成：进入切片审阅视图（narration/drama 全部生成路径——
           // reference_video 此时 units 为空，同样没有可展示内容）；ad 恒单集无源文
           // 切片，走各自画布。
-          const showSourceReview = Boolean(episode) && !script && !hasDraft && !isAd;
+          // 演示项目没有源文可切片，缺剧本的分集直接说明「演示只做到第 1 集」
+          const showSourceReview =
+            Boolean(episode) && !script && !hasDraft && !isAd && !demoMode;
 
           return (
             <div className="flex h-full flex-col">
               <div className="min-h-0 flex-1">
-                {showSourceReview && episode ? (
+                {demoMode && !script ? (
+                  <DemoEpisodePlaceholder />
+                ) : showSourceReview && episode ? (
                   <EpisodeSourceReview
                     projectName={currentProjectName}
                     episode={epNum}
@@ -677,6 +727,7 @@ export function StudioCanvasRouter() {
                     projectName={currentProjectName}
                     episode={epNum}
                     episodeTitle={episode?.title}
+                    // 演示态的只读由 TimelineCanvas 直读判定收口，这里只表达非演示态的固有约束
                     onSaveTitle={(title) => handleUpdateEpisodeTitle(epNum, title)}
                     canEditTitle={Boolean(episode?.script_file)}
                     hasDraft={hasDraft}
@@ -686,7 +737,9 @@ export function StudioCanvasRouter() {
                     durationOptions={effectiveDurationOptions}
                     onUpdatePrompt={handleUpdatePrompt}
                     onMoveShot={isAd ? handleMoveShot : undefined}
-                    onGenerateStoryboard={adReference ? undefined : voidPromise(handleGenerateStoryboard)}
+                    onGenerateStoryboard={
+                      adReference ? undefined : voidPromise(handleGenerateStoryboard)
+                    }
                     onGenerateVideo={adReference ? undefined : voidPromise(handleGenerateVideo)}
                     onGenerateNarration={voidPromise(handleGenerateNarration)}
                     onGenerateEpisodeNarration={voidPromise(handleGenerateEpisodeNarration)}

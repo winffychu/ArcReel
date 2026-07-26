@@ -134,6 +134,16 @@ MESSAGES = {
     "endpoint_media_type_mismatch": "Endpoint media_type mismatch: {detail}",
     "backend_creation_failed": "Backend creation failed: {err_msg}",
     "unsupported_discovery_format": "Connection test not supported for {discovery_format}",
+    "capability_overrides_video_only": (
+        "Endpoint {endpoint} of model {model_id} is not a video endpoint; capability overrides are not supported"
+    ),
+    "capability_override_invalid_value": (
+        "Capability {capability} of model {model_id} has an invalid value type; expected {expected}"
+    ),
+    "capability_override_last_frame_unsupported": (
+        "Endpoint {endpoint} of model {model_id} does not support last-frame generation; "
+        "last_frame cannot be overridden to true"
+    ),
     # Projects
     "unknown_style_template": "Unknown style template: {template_id}",
     "ad_only_field": "{field} is only available for ad/short-video projects (content_mode=ad)",
@@ -217,6 +227,7 @@ MESSAGES = {
     "video_duration_not_supported": "Video duration {duration}s is not within the durations supported by this model ({supported})",
     "video_capability_missing_t2v": "{provider}/{model} does not support text-to-video; provide a first-frame image or switch to a model that supports text-to-video",
     "video_resolution_duration_unsupported": "Model {model} does not support {duration}s at {resolution} resolution (only {supported}); adjust the resolution or duration",
+    "video_reference_images_duration_unsupported": "Model {model} does not support {duration}s with reference images (only {supported}); change the duration to {supported} or remove the reference images",
     "video_reference_images_required": "Model {model} requires at least one reference image; please provide reference images",
     "video_reference_images_unreadable": "Model {model} has reference images that are missing or unreadable; generation aborted: {names}; check the reference image paths",
     "video_reference_images_unsupported": "Model {model} does not support multi-subject reference images; remove the reference images or switch to a model that supports reference-to-video",
@@ -225,6 +236,8 @@ MESSAGES = {
     "video_start_image_unreadable": "The first-frame image for model {model} is unreadable; generation aborted: {name}; check the first-frame image path",
     "video_end_image_unreadable": "The last-frame image for model {model} is unreadable; generation aborted: {name}; check the last-frame image path",
     "video_end_image_requires_start_image": "Model {model} does not support a standalone last frame; also provide a first frame (first+last keyframes) or remove the last frame",
+    "video_last_frame_requires_pro": "{provider}/{model} only supports first+last frame at the pro tier; switch to the pro tier or remove the last frame",
+    "video_last_frame_unsupported": "{provider}/{model} does not support a last frame under the current configuration; generation aborted. Remove the shot's last frame, or switch to a model or tier that supports it",
     # Agent credentials
     "agent_preset_unknown": "Unknown preset provider: {preset_id}",
     "agent_base_url_required_custom": "base_url is required for custom configuration",

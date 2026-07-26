@@ -131,6 +131,9 @@ MESSAGES = {
     "endpoint_media_type_mismatch": "模型 endpoint 与媒体类型不一致: {detail}",
     "backend_creation_failed": "Backend 创建失败: {err_msg}",
     "unsupported_discovery_format": "供应商 {discovery_format} 暂不支持连接测试",
+    "capability_overrides_video_only": "模型 {model_id} 的 endpoint {endpoint} 不是视频类，不支持能力覆盖",
+    "capability_override_invalid_value": "模型 {model_id} 的能力项 {capability} 取值类型不正确，应为 {expected}",
+    "capability_override_last_frame_unsupported": "模型 {model_id} 的 endpoint {endpoint} 不支持尾帧生成，无法覆盖 last_frame 为开启",
     # Projects
     "unknown_style_template": "未知的风格模版: {template_id}",
     "ad_only_field": "{field} 仅广告/短片项目（content_mode=ad）可用",
@@ -214,6 +217,7 @@ MESSAGES = {
     "video_duration_not_supported": "视频时长 {duration}s 不在该模型支持的时长（{supported}）内",
     "video_capability_missing_t2v": "{provider}/{model} 不支持文生视频；请提供首帧图，或换一个支持文生视频的模型",
     "video_resolution_duration_unsupported": "模型 {model} 在 {resolution} 分辨率下不支持 {duration}s（仅支持 {supported}）；请调整分辨率或时长",
+    "video_reference_images_duration_unsupported": "模型 {model} 使用参考图时不支持 {duration}s（仅支持 {supported}）；请把时长改为 {supported}，或移除参考图",
     "video_reference_images_required": "模型 {model} 需要至少一张参考图；请提供参考图",
     "video_reference_images_unreadable": "模型 {model} 有参考图缺失或无法读取，已中止生成：{names}；请检查参考图路径",
     "video_reference_images_unsupported": "模型 {model} 不支持多图主体参考；请移除参考图，或换一个支持参考生视频的模型",
@@ -222,6 +226,8 @@ MESSAGES = {
     "video_start_image_unreadable": "模型 {model} 的首帧图无法读取，已中止生成：{name}；请检查首帧图路径",
     "video_end_image_unreadable": "模型 {model} 的尾帧图无法读取，已中止生成：{name}；请检查尾帧图路径",
     "video_end_image_requires_start_image": "模型 {model} 不支持单独的尾帧；请同时提供首帧（首尾帧模式），或移除尾帧",
+    "video_last_frame_requires_pro": "{provider}/{model} 的首尾帧仅在 pro 档生效；请切换到 pro 档，或移除尾帧",
+    "video_last_frame_unsupported": "{provider}/{model} 当前配置不支持尾帧，已中止生成；请移除该镜头的尾帧，或改用支持尾帧的模型/档位",
     # Agent credentials
     "agent_preset_unknown": "未知预设供应商: {preset_id}",
     "agent_base_url_required_custom": "自定义配置需要填写 base_url",
