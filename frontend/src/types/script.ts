@@ -207,6 +207,12 @@ export interface NarrationSegment {
   video_prompt: VideoPrompt | string;
   transition_to_next: TransitionType;
   note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
   generated_assets?: GeneratedAssets;
 }
 
@@ -226,6 +232,12 @@ export interface DramaScene {
   utterances?: Utterance[];
   transition_to_next: TransitionType;
   note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
   generated_assets?: GeneratedAssets;
 }
 
@@ -254,15 +266,6 @@ export interface DramaEpisodeScript {
   novel: NovelInfo;
   scenes: DramaScene[];
 }
-
-/**
- * 参考生视频路径下单镜头时长可选值（1-15 秒自由整数）。
- * 与后端 lib/script_models.py 的 REFERENCE_SHOT_DURATION_RANGE 同源，调整区间时两侧同步。
- */
-export const REFERENCE_SHOT_DURATION_OPTIONS: number[] = Array.from(
-  { length: 15 },
-  (_, i) => i + 1,
-);
 
 /** 带货框架 section 八值引导（与后端审定配比表用词一致；不硬枚举，允许自定义值）。 */
 export const AD_SECTION_VALUES = [
@@ -293,6 +296,12 @@ export interface AdShot {
   video_prompt: VideoPrompt | string;
   transition_to_next: TransitionType;
   note?: string;
+  /**
+   * 尾帧快照路径（项目内相对路径）。视频从分镜图开场、过渡到这张图收尾。
+   * 只由 /end-frame 的设置/清除端点写入——通用剧本 PATCH 刻意不接受该字段，
+   * 避免绕过快照复制写出悬空引用（见 server/routers/end_frames.py）。
+   */
+  end_frame_image?: string | null;
   generated_assets?: GeneratedAssets;
 }
 
