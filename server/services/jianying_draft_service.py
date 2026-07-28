@@ -52,7 +52,7 @@ _SPAN_SUBTITLE_MODES: frozenset[str] = frozenset({"drama"})
 from lib.path_safety import PathTraversalError, safe_join, safe_resolve
 from lib.project_manager import ProjectManager, effective_mode
 from lib.reference_video.ad_units import ad_shots_by_id
-from lib.script_models import ad_shot_duration_seconds
+from lib.script_models import ad_shot_duration_seconds, get_generated_assets
 from lib.script_skeleton import SKELETONS, resolve_declared_kind
 from lib.speech_rate import estimate_spoken_seconds
 
@@ -163,7 +163,7 @@ class JianyingDraftService:
 
         clips = []
         for item in items:
-            assets = item.get("generated_assets") or {}
+            assets = get_generated_assets(item)
             video_clip = assets.get("video_clip")
             if not video_clip:
                 continue

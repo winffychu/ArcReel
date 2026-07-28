@@ -12,14 +12,46 @@ from sqlalchemy import bindparam as sa_bindparam
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from lib.db.base import DEFAULT_USER_ID, dt_to_iso, utc_now
-from lib.db.models.task import Task, TaskEvent, WorkerLease
+from lib.db.models.task import Task, WorkerLease
 from lib.db.repositories.base import BaseRepository, rowcount
+from lib.task_failure import bound_reason, collapse_cascade_reason, encode_failure
+from lib.task_terminal_events import TERMINAL_TASK_STATUSES
 
 logger = logging.getLogger(__name__)
 
 ACTIVE_TASK_STATUSES = ("queued", "running", "cancelling")
+
+# 落库 error_message 的长度上限。裸切片会把结构化原因切在 JSON 中途，使 render_failure
+# 无法解析、用户看到机器码碎片而非本地化文案，因此两条落库路径都经 bound_reason 收窄。
+# 级联编码另在编码前按预算裁剪 reason（_encode_bounded_cascade_failure），保证结果本身
+# 不需要再被截断，深层依赖链也不会近指数增长。
+_MAX_ERROR_MESSAGE_LEN = 2000
+
+
+def _encode_bounded_cascade_failure(*, dependency_task_id: str, reason: str) -> str:
+    # 上游原因本身是级联串时先折叠到根本原因：逐层包裹近指数增长，深链上裁剪只能把内层信封
+    # 切在 JSON 中途，读侧会把残缺内层当普通文本嵌进本地化文案。折叠后串长与链深无关。
+    reason = collapse_cascade_reason(reason)
+    encoded = encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=reason)
+    if len(encoded) <= _MAX_ERROR_MESSAGE_LEN:
+        return encoded
+
+    overhead = len(encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=""))
+    budget = max(_MAX_ERROR_MESSAGE_LEN - overhead, 0)
+    # JSON 转义（reason 中的引号/反斜杠）会让 budget 字符的 reason 编码后略超预算；始终经
+    # bound_reason 收窄以保持结构化 reason 合法，不对已裁剪结果做原始字符再截断（那会切断
+    # JSON 尾部）。极少数迭代仍超限时接受结果略超 _MAX_ERROR_MESSAGE_LEN，好过写坏 JSON。
+    for _ in range(5):
+        reason = bound_reason(reason, budget)
+        encoded = encode_failure("cascade_blocked_dependency", dependency_task_id=dependency_task_id, reason=reason)
+        overflow = len(encoded) - _MAX_ERROR_MESSAGE_LEN
+        if overflow <= 0 or budget <= 0:
+            break
+        budget = max(budget - overflow, 0)
+    return encoded
 
 
 def _json_dumps(value: Any) -> str:
@@ -63,40 +95,32 @@ def _task_to_dict(row: Task) -> dict[str, Any]:
     }
 
 
-def _event_to_dict(row: TaskEvent) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "task_id": row.task_id,
-        "project_name": row.project_name,
-        "event_type": row.event_type,
-        "status": row.status,
-        "data": _json_loads(row.data_json, {}),
-        "created_at": dt_to_iso(row.created_at),
-    }
-
-
 class TaskRepository(BaseRepository):
-    async def _append_event(
+    def __init__(self, session: AsyncSession):
+        super().__init__(session)
+        # 本次会话内落地的任务终态，供上层（GenerationQueue）在事务提交后发布项目事件。
+        # 在此收集而非各终态方法各自记账：所有终态迁移（含级联失败/级联取消、批量取消
+        # 队列）都经 _record_terminal_event 收口，一处挂钩即全覆盖。
+        self.terminal_events: list[dict[str, Any]] = []
+
+    def _record_terminal_event(
         self,
         *,
         task_id: str,
         project_name: str,
-        event_type: str,
         status: str,
-        data: dict | None = None,
-    ) -> int:
-        now = utc_now()
-        event = TaskEvent(
-            task_id=task_id,
-            project_name=project_name,
-            event_type=event_type,
-            status=status,
-            data_json=_json_dumps(data or {}),
-            created_at=now,
-        )
-        self.session.add(event)
-        await self.session.flush()
-        return event.id
+        task_type: str | None = None,
+    ) -> None:
+        """非终态调用是空操作：状态守卫兜住未来新增的非终态调用点，避免发出无对应动作的事件。"""
+        if status in TERMINAL_TASK_STATUSES:
+            self.terminal_events.append(
+                {
+                    "task_id": task_id,
+                    "project_name": project_name,
+                    "status": status,
+                    "task_type": task_type,
+                }
+            )
 
     async def enqueue(
         self,
@@ -168,14 +192,6 @@ class TaskRepository(BaseRepository):
                 }
             raise
 
-        task_data = _task_to_dict(task)
-        await self._append_event(
-            task_id=task_id,
-            project_name=project_name,
-            event_type="queued",
-            status="queued",
-            data=task_data,
-        )
         await self.session.commit()
 
         return {
@@ -260,14 +276,6 @@ class TaskRepository(BaseRepository):
         result = await self.session.execute(select(Task).where(Task.task_id == target_task_id))
         running_task = result.scalar_one()
         task_data = _task_to_dict(running_task)
-
-        await self._append_event(
-            task_id=target_task_id,
-            project_name=running_task.project_name,
-            event_type="running",
-            status="running",
-            data=task_data,
-        )
         await self.session.commit()
         return task_data
 
@@ -298,13 +306,11 @@ class TaskRepository(BaseRepository):
         await self.session.flush()
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         done_task = res.scalar_one()
-        task_data = _task_to_dict(done_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=done_task.project_name,
-            event_type="succeeded",
             status="succeeded",
-            data=task_data,
+            task_type=done_task.task_type,
         )
         await self.session.commit()
         return affected
@@ -331,7 +337,7 @@ class TaskRepository(BaseRepository):
             .where(Task.task_id == task_id, Task.status == "running")
             .values(
                 status="failed",
-                error_message=error_message[:2000],
+                error_message=bound_reason(error_message, _MAX_ERROR_MESSAGE_LEN),
                 finished_at=now,
                 updated_at=now,
             )
@@ -343,13 +349,11 @@ class TaskRepository(BaseRepository):
         await self.session.flush()
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         failed_task = res.scalar_one()
-        task_data = _task_to_dict(failed_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=failed_task.project_name,
-            event_type="failed",
             status="failed",
-            data=task_data,
+            task_type=failed_task.task_type,
         )
         return affected
 
@@ -361,7 +365,7 @@ class TaskRepository(BaseRepository):
             .where(Task.task_id == task_id, Task.status == "queued")
             .values(
                 status="failed",
-                error_message=error_message[:2000],
+                error_message=bound_reason(error_message, _MAX_ERROR_MESSAGE_LEN),
                 finished_at=now,
                 updated_at=now,
             )
@@ -373,17 +377,19 @@ class TaskRepository(BaseRepository):
         await self.session.flush()
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         failed_task = res.scalar_one()
-        task_data = _task_to_dict(failed_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=failed_task.project_name,
-            event_type="failed",
             status="failed",
-            data=task_data,
+            task_type=failed_task.task_type,
         )
         return affected
 
     async def _cascade_failed_queued(self, *, task_id: str, error_message: str) -> int:
+        """按依赖链级联标失败。`error_message` 沿链条原样传递（根因，不随层数重新嵌套），
+        每层只把自己的直接阻塞方 `task_id` 写入编码——避免深层依赖链把上一层的完整编码串
+        再嵌套进新一层 JSON 造成的近指数增长与落库截断损坏。
+        """
         result = await self.session.execute(
             select(Task.task_id)
             .where(
@@ -396,12 +402,12 @@ class TaskRepository(BaseRepository):
 
         cascaded = 0
         for dep_id in dependent_ids:
-            blocked_message = f"blocked by failed dependency {task_id}: {error_message}"
+            blocked_message = _encode_bounded_cascade_failure(dependency_task_id=task_id, reason=error_message)
             affected = await self._mark_failed_queued_dep(task_id=dep_id, error_message=blocked_message)
             if affected == 0:
                 continue
             cascaded += affected
-            cascaded += await self._cascade_failed_queued(task_id=dep_id, error_message=blocked_message)
+            cascaded += await self._cascade_failed_queued(task_id=dep_id, error_message=error_message)
         return cascaded
 
     async def get_cancel_preview(self, task_id: str) -> dict[str, Any]:
@@ -578,12 +584,11 @@ class TaskRepository(BaseRepository):
         res = await self.session.execute(select(Task).where(Task.task_id == task_id))
         cancelled_task = res.scalar_one()
         task_data = _task_to_dict(cancelled_task)
-        await self._append_event(
+        self._record_terminal_event(
             task_id=task_id,
             project_name=cancelled_task.project_name,
-            event_type="cancelled",
             status="cancelled",
-            data=task_data,
+            task_type=cancelled_task.task_type,
         )
 
         # 先把自身入 cancelled 列表，再级联——保证 cancel_task 响应体里父先于子。
@@ -613,22 +618,7 @@ class TaskRepository(BaseRepository):
             .values(status="cancelling", cancelled_by=cancelled_by, updated_at=now)
         )
         result = await self.session.execute(stmt)
-        affected = rowcount(result)
-        if affected == 0:
-            return 0
-
-        await self.session.flush()
-        res = await self.session.execute(select(Task).where(Task.task_id == task_id))
-        cancelling_task = res.scalar_one()
-        task_data = _task_to_dict(cancelling_task)
-        await self._append_event(
-            task_id=task_id,
-            project_name=cancelling_task.project_name,
-            event_type="cancelling",
-            status="cancelling",
-            data=task_data,
-        )
-        return affected
+        return rowcount(result)
 
     async def _cascade_cancel_dependents(
         self,
@@ -769,13 +759,11 @@ class TaskRepository(BaseRepository):
                 select(Task).where(Task.task_id.in_(task_ids), Task.status == "cancelled")
             )
             for updated_task in refreshed.scalars().all():
-                task_data = _task_to_dict(updated_task)
-                await self._append_event(
+                self._record_terminal_event(
                     task_id=updated_task.task_id,
                     project_name=project_name,
-                    event_type="cancelled",
                     status="cancelled",
-                    data=task_data,
+                    task_type=updated_task.task_type,
                 )
 
         await self.session.commit()
@@ -821,20 +809,6 @@ class TaskRepository(BaseRepository):
         rows = await self.session.execute(select(Task).where(Task.task_id.in_(task_ids), Task.status == "queued"))
         requeued_tasks = rows.scalars().all()
 
-        # Step 4: bulk-insert all requeue events
-        event_now = utc_now()
-        events = [
-            TaskEvent(
-                task_id=t.task_id,
-                project_name=t.project_name,
-                event_type="requeued",
-                status="queued",
-                data_json=_json_dumps(_task_to_dict(t)),
-                created_at=event_now,
-            )
-            for t in requeued_tasks
-        ]
-        self.session.add_all(events)
         await self.session.commit()
         return len(requeued_tasks)
 
@@ -918,47 +892,6 @@ class TaskRepository(BaseRepository):
             total += cnt
         stats["total"] = total
         return stats
-
-    async def get_recent_tasks_snapshot(
-        self,
-        *,
-        project_name: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        limit = max(1, min(1000, limit))
-        stmt = select(Task)
-        if project_name:
-            stmt = stmt.where(Task.project_name == project_name)
-        stmt = stmt.order_by(Task.updated_at.desc()).limit(limit)
-        stmt = self._scope_query(stmt, Task)
-
-        result = await self.session.execute(stmt)
-        return [_task_to_dict(t) for t in result.scalars().all()]
-
-    # NOTE: In multi-user mode, override this method to filter by user via JOIN Task
-    async def get_events_since(
-        self,
-        *,
-        last_event_id: int,
-        project_name: str | None = None,
-        limit: int = 200,
-    ) -> list[dict[str, Any]]:
-        limit = max(1, min(1000, limit))
-        stmt = select(TaskEvent).where(TaskEvent.id > last_event_id)
-        if project_name:
-            stmt = stmt.where(TaskEvent.project_name == project_name)
-        stmt = stmt.order_by(TaskEvent.id.asc()).limit(limit)
-
-        result = await self.session.execute(stmt)
-        return [_event_to_dict(e) for e in result.scalars().all()]
-
-    # NOTE: In multi-user mode, override this method to filter by user via JOIN Task
-    async def get_latest_event_id(self, *, project_name: str | None = None) -> int:
-        stmt = select(func.max(TaskEvent.id))
-        if project_name:
-            stmt = stmt.where(TaskEvent.project_name == project_name)
-        result = await self.session.execute(stmt)
-        return result.scalar() or 0
 
     # ---- Worker Lease ----
 

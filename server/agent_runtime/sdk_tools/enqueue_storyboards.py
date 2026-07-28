@@ -16,6 +16,7 @@ from lib.generation_queue_client import (
     batch_enqueue_and_wait,
 )
 from lib.prompt_utils import image_prompt_to_yaml, is_structured_image_prompt, normalize_style
+from lib.script_models import get_generated_assets
 from lib.storyboard_sequence import (
     StoryboardTaskPlan,
     build_storyboard_dependency_plan,
@@ -93,7 +94,7 @@ def _select_items(items: list[dict[str, Any]], id_field: str, segment_ids: list[
     if segment_ids is not None:
         wanted = {str(s) for s in segment_ids}
         return [item for item in items if str(item.get(id_field)) in wanted]
-    return [item for item in items if not item.get("generated_assets", {}).get("storyboard_image")]
+    return [item for item in items if not get_generated_assets(item).get("storyboard_image")]
 
 
 def _build_specs(

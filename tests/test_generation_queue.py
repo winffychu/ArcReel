@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from lib.db.base import Base
 from lib.generation_queue import GenerationQueue
+from lib.task_failure import encode_failure
 
 
 @pytest.fixture
@@ -71,33 +72,6 @@ class TestGenerationQueue:
         )
         assert not second["deduped"]
         assert second["task_id"] != first["task_id"]
-
-    async def test_event_sequence_and_incremental_read(self, queue):
-        task = await queue.enqueue_task(
-            project_name="demo",
-            task_type="video",
-            media_type="video",
-            resource_id="E1S01",
-            payload={"prompt": "video"},
-            script_file="episode_01.json",
-            source="skill",
-        )
-        await queue.claim_next_task(media_type="video")
-        await queue.mark_task_failed(task["task_id"], "mock error")
-
-        all_events = await queue.get_events_since(last_event_id=0)
-        assert len(all_events) >= 3
-        assert all_events[0]["event_type"] == "queued"
-        assert all_events[1]["event_type"] == "running"
-        assert all_events[2]["event_type"] == "failed"
-
-        last_seen_id = all_events[1]["id"]
-        incremental = await queue.get_events_since(last_event_id=last_seen_id)
-        assert all(event["id"] > last_seen_id for event in incremental)
-        assert any(event["event_type"] == "failed" for event in incremental)
-
-        latest_id = await queue.get_latest_event_id()
-        assert latest_id == all_events[-1]["id"]
 
     async def test_worker_lease_takeover(self, queue):
         first_ok = await queue.acquire_or_renew_worker_lease(
@@ -228,9 +202,16 @@ class TestGenerationQueue:
         assert third_task is not None
         assert second_task["status"] == "failed"
         assert third_task["status"] == "failed"
-        assert "blocked by failed dependency" in second_task["error_message"]
-        assert first["task_id"] in second_task["error_message"]
-        assert second["task_id"] in third_task["error_message"]
+        # 每层只记直接阻塞方 task_id，reason 沿链条原样传递根因（不随层数重新嵌套）——
+        # 避免深层依赖链把上一层的完整编码串再嵌套进新一层 JSON 造成的近指数增长。
+        expected_second = encode_failure(
+            "cascade_blocked_dependency", dependency_task_id=first["task_id"], reason="boom"
+        )
+        expected_third = encode_failure(
+            "cascade_blocked_dependency", dependency_task_id=second["task_id"], reason="boom"
+        )
+        assert second_task["error_message"] == expected_second
+        assert third_task["error_message"] == expected_third
 
     async def test_requeue_running_tasks(self, queue):
         task = await queue.enqueue_task(
@@ -257,9 +238,6 @@ class TestGenerationQueue:
         claimed_again = await queue.claim_next_task(media_type="video")
         assert claimed_again is not None
         assert claimed_again["task_id"] == task["task_id"]
-
-        events = await queue.get_events_since(last_event_id=0)
-        assert any(event["event_type"] == "requeued" for event in events)
 
     async def test_cancel_task(self, queue):
         result = await queue.enqueue_task(

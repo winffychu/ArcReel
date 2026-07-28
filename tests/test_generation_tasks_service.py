@@ -620,6 +620,28 @@ class TestGenerationTasks:
             )
         assert fake_generator.video_calls == []
 
+    @pytest.mark.integration
+    async def test_execute_video_task_generated_assets_non_dict_falls_back_to_default(self, monkeypatch, tmp_path):
+        """generated_assets 容器本身被外部编辑损坏为非 dict（如 list）时按「未设置」处理、
+        回退默认路径，不抛未捕获 AttributeError（`{"...": ...}.get()` 在非 dict 上不存在）。"""
+        project_path = _prepare_files(tmp_path)
+        fake_pm = _FakePM(project_path)
+        fake_generator = _FakeGenerator()
+        fake_pm.script["segments"][0]["generated_assets"] = ["bad"]
+
+        monkeypatch.setattr(generation_tasks, "get_project_manager", lambda: fake_pm)
+        monkeypatch.setattr(generation_tasks, "resolve_generation_context", _fake_resolve_ctx(fake_generator))
+        monkeypatch.setattr(generation_tasks, "extract_video_thumbnail", _async_return(None))
+        monkeypatch.setattr(generation_tasks, "emit_project_change_batch", lambda *a, **kw: None)
+
+        await generation_tasks.execute_video_task(
+            "demo",
+            "E1S01",
+            {"script_file": "episode_1.json", "prompt": {"action": "跑", "camera_motion": "Static", "dialogue": []}},
+        )
+
+        assert fake_generator.video_calls[0]["start_image"] == project_path / "storyboards" / "scene_E1S01.png"
+
     @pytest.mark.parametrize(
         ("storyboard_value", "expected_message"),
         [
@@ -1123,6 +1145,51 @@ class TestGenerationTasks:
         )
         assert result["resource_type"] == "videos"
         assert fake_generator.video_calls[0]["duration_seconds"] == 6
+
+    async def test_execute_video_task_default_duration_respects_resolution_constraint(self, monkeypatch, tmp_path):
+        """Auto（无显式 duration）在受约束分辨率下取约束内的时长，而非 supported_durations 首项。
+
+        Veo + 4k 只接受 8 秒；取首项 4 秒会让默认设置必然撞上 backend 的执行期拒绝。
+        """
+        project_path = _prepare_files(tmp_path)
+        fake_pm = _FakePM(project_path)
+        fake_generator = _FakeGenerator()
+
+        monkeypatch.setattr(generation_tasks, "get_project_manager", lambda: fake_pm)
+        monkeypatch.setattr(
+            generation_tasks,
+            "resolve_generation_context",
+            _fake_resolve_ctx(
+                fake_generator,
+                video_provider=("gemini-aistudio", "veo-3.1-generate-preview"),
+                video_resolution="4k",
+                supported_durations=(4, 6, 8),
+            ),
+        )
+        monkeypatch.setattr(generation_tasks, "extract_video_thumbnail", _async_return(None))
+        monkeypatch.setattr(generation_tasks, "emit_project_change_batch", lambda *a, **kw: None)
+        fake_pm.project.pop("default_duration", None)
+
+        await generation_tasks.execute_video_task(
+            "demo",
+            "E1S01",
+            {"script_file": "episode_1.json", "prompt": {"action": "跑", "camera_motion": "Static", "dialogue": []}},
+        )
+        assert fake_generator.video_calls[0]["duration_seconds"] == 8
+
+    async def test_constrain_durations_by_resolution_falls_back(self):
+        """无声明 / 未登记型号 / 交集为空时返回原候选，不把候选清空。"""
+        constrain = generation_tasks.constrain_durations_by_resolution
+        # 已登记且有声明：按声明收窄（大小写不敏感）
+        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], "4K") == [8]
+        # 该分辨率无声明
+        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], "720p") == [4, 6, 8]
+        # 型号未登记（中转站 / 自定义供应商包装）
+        assert constrain("gemini-aistudio", "veo-3.1-via-relay", [4, 6, 8], "4k") == [4, 6, 8]
+        # 交集为空（声明自相矛盾，不该发生）：保留原候选而非清空
+        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6], "4k") == [4, 6]
+        # resolution 缺失
+        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], None) == [4, 6, 8]
 
     async def test_empty_supported_durations_guard_permissive(self, monkeypatch, tmp_path):
         """能力不可解析时 lane 交付空 supported_durations：守卫放行（不更坏），

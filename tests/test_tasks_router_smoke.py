@@ -1,4 +1,4 @@
-"""Tests for task router endpoints and SSE events."""
+"""Smoke tests for task router endpoints against a real generation queue."""
 
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -17,8 +17,8 @@ def _build_app():
     return app
 
 
-class TestTaskRouterAndEvents:
-    async def test_task_router_endpoints_and_incremental_events(self, generation_queue):
+class TestTaskRouterEndpoints:
+    async def test_task_router_endpoints_after_enqueue_claim_fail(self, generation_queue):
         queue = generation_queue
         task = await queue.enqueue_task(
             project_name="demo",
@@ -46,40 +46,3 @@ class TestTaskRouterAndEvents:
             assert stats_resp.status_code == 200
             stats = stats_resp.json()["stats"]
             assert stats["failed"] == 1
-
-        events = await queue.get_events_since(last_event_id=0, project_name="demo")
-        assert len(events) >= 3
-
-        last_running_id = events[1]["id"]
-        incremental = await queue.get_events_since(last_event_id=last_running_id, project_name="demo")
-        assert all(event["id"] > last_running_id for event in incremental)
-        assert any(event["event_type"] == "failed" for event in incremental)
-
-    async def test_sse_task_event_has_frontend_shape(self, generation_queue):
-        """SSE task 事件应匹配前端 TaskStreamTaskPayload 结构。"""
-        from server.routers.tasks import _transform_task_event
-
-        queue = generation_queue
-        task = await queue.enqueue_task(
-            project_name="demo",
-            task_type="storyboard",
-            media_type="image",
-            resource_id="E1S02",
-            payload={"prompt": "p"},
-            script_file="episode_01.json",
-            source="webui",
-        )
-
-        events = await queue.get_events_since(last_event_id=0, project_name="demo")
-        assert len(events) >= 1
-
-        stats = await queue.get_task_stats(project_name="demo")
-        transformed = _transform_task_event(events[0], stats)
-
-        assert transformed["action"] == "created"
-        assert transformed["task"]["task_id"] == task["task_id"]
-        assert transformed["task"]["status"] == "queued"
-        assert "queued" in transformed["stats"]
-        assert "running" in transformed["stats"]
-        assert "total" in transformed["stats"]
-        assert transformed["stats"]["queued"] >= 1

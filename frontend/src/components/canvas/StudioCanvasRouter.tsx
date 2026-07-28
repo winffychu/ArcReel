@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { errMsg, voidPromise } from "@/utils/async";
 import { Route, Switch, Redirect } from "wouter";
 import {
@@ -18,6 +18,7 @@ import { isDemoProject } from "@/onboarding/demo-project";
 import { DemoEpisodePlaceholder } from "@/onboarding/DemoEpisodePlaceholder";
 import { useAppStore } from "@/stores/app-store";
 import { useConfigStatusStore } from "@/stores/config-status-store";
+import { useCapabilitiesStore } from "@/stores/capabilities-store";
 import { useActiveResourceIds } from "@/stores/tasks-store";
 import { TimelineCanvas } from "./timeline/TimelineCanvas";
 import { OverviewCanvas } from "./OverviewCanvas";
@@ -44,7 +45,8 @@ import {
   enqueueVideo,
 } from "@/actions/generation";
 import { buildEntityRevisionKey } from "@/utils/project-changes";
-import { getProviderModels, getCustomProviderModels, lookupSupportedDurations } from "@/utils/provider-models";
+import { getProviderModels, getCustomProviderModels } from "@/utils/provider-models";
+import { useModelCapabilities } from "@/hooks/useModelCapabilities";
 import { effectiveMode } from "@/utils/generation-mode";
 import type { Scene, Prop, Product, CustomProviderInfo, ProviderInfo } from "@/types";
 import type { EpisodeScript } from "@/types/script";
@@ -88,7 +90,7 @@ export function StudioCanvasRouter() {
   const tRef = useRef(t);
   // eslint-disable-next-line react-hooks/refs -- tRef 是稳定 event-handler ref 模式，用于在回调中获取最新 t 而不触发无限 useCallback 重建
   tRef.current = t;
-  const { currentProjectData, currentProjectName, currentScripts } =
+  const { currentProjectData, currentProjectName, currentScripts, projectDetailLoading } =
     useProjectsStore();
   // 演示态：资产画布仍走 readOnly 透传，工作台时间线的只读则由组件自己直读同一判定。
   // useDemoWorkbench() 已把路由参数与 store 的判定滞后收口在单一来源，此处直接消费。
@@ -97,9 +99,10 @@ export function StudioCanvasRouter() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [customProviders, setCustomProviders] = useState<CustomProviderInfo[]>([]);
   const [globalVideoBackend, setGlobalVideoBackend] = useState("");
-  const [resolvedDurationOptions, setResolvedDurationOptions] = useState<
-    number[] | undefined
-  >(undefined);
+
+  // 目录侧与服务端侧听同一个失效信号：本组件跨路由原地复用，改完全局默认后端 / 自定义供应商
+  // 回到工作台不会重挂载，只重取服务端能力而留着旧目录的话，时长仍按旧配置解析。
+  const capabilitiesRevision = useCapabilitiesStore((s) => s.revision);
 
   useEffect(() => {
     // 这三份数据只服务视频时长选项。演示态的时长是虚构的静态展示，唯一还会用到选项的
@@ -115,69 +118,24 @@ export function StudioCanvasRouter() {
       },
     ).catch(() => {});
     return () => { disposed = true; };
-  }, [demoMode]);
+  }, [demoMode, capabilitiesRevision]);
 
-  // 已配置 backend 时本地 lookup 即可（同步、零延迟）；未配置时调后端
-  // /video-capabilities，让 ConfigResolver 自动 fallback 到 PROVIDER_REGISTRY
-  // 第一个 ready 的 default video model（与生成路径用同一套规则，避免 FE/BE 漂移）。
-  const localDurationOptions = useMemo(() => {
-    // 演示态即便 state 里还留着上一个真实项目的 providers/backend（同一组件实例原地切入
-    // 演示路由，effect 提前 return 不会清掉旧值），也不参与比对——否则真实后端的时长限制
-    // 会继续套用到演示的虚构时长上，重新触发「不兼容」误报。demoMode 演示→真实切换时先于
-    // store 变为 false，currentProjectName 单独判一次兜住这一帧仍读到旧演示项目名的窗口。
-    if (demoMode || isDemoProject(currentProjectName)) return undefined;
-    const backend = currentProjectData?.video_backend || globalVideoBackend;
-    if (!backend) return undefined;
-    return lookupSupportedDurations(providers, backend, customProviders);
-  }, [
-    demoMode,
-    currentProjectName,
+  // 演示态即便 state 里还留着上一个真实项目的 providers/backend（同一组件实例原地切入演示
+  // 路由，effect 提前 return 不会清掉旧值），也不参与解析——否则真实后端的时长限制会继续套用
+  // 到演示的虚构时长上，触发「不兼容」误报。demoMode 演示→真实切换时先于 store 变为 false，
+  // currentProjectName 单独判一次兜住这一帧仍读到旧演示项目名的窗口。
+  const capabilitiesEnabled = !demoMode && !isDemoProject(currentProjectName);
+
+  // 时长选项只用于「时长与后端不兼容」的橙色标记，取未经联动约束收窄的全集。
+  // 后端未配置时能力管线退回服务端解析出的 model（与生成路径同一套规则，避免 FE/BE 漂移）。
+  const { rawDurations } = useModelCapabilities({
+    projectName: currentProjectName,
+    videoBackend: currentProjectData?.video_backend || globalVideoBackend,
     providers,
     customProviders,
-    globalVideoBackend,
-    currentProjectData?.video_backend,
-  ]);
-
-  useEffect(() => {
-    // 依赖变化时清理旧的 resolved 选项；本地 lookup 有结果或缺项目名时同步清零，
-    // 否则在异步拉取新项目的 /video-capabilities 之前先 reset 以避免沿用旧值。
-    if (localDurationOptions !== undefined) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setResolvedDurationOptions(undefined);
-      return;
-    }
-    // 演示项目查不到 /video-capabilities（后端无此项目），时长选项留空即可。
-    // currentProjectName 单独判一次：demo→真实项目切换后路由已使 demoMode 为 false，
-    // 但 store 的 currentProjectName 还没同步完成时仍是演示项目名，只看 demoMode 会
-    // 对着不存在的演示项目发一次必然失败的请求。
-    if (!currentProjectName || demoMode || isDemoProject(currentProjectName)) {
-      setResolvedDurationOptions(undefined);
-      return;
-    }
-    setResolvedDurationOptions(undefined);
-    let disposed = false;
-    API.getVideoCapabilities(currentProjectName)
-      .then((caps) => {
-        if (disposed) return;
-        setResolvedDurationOptions(caps.supported_durations);
-      })
-      .catch(() => {
-        if (disposed) return;
-        setResolvedDurationOptions(undefined);
-      });
-    return () => {
-      disposed = true;
-    };
-  }, [currentProjectName, localDurationOptions, demoMode]);
-
-  // demoMode 翻转的同一渲染帧内 localDurationOptions 已同步归零，但 resolvedDurationOptions
-  // 是异步 effect 才清空的旧 state，真实项目切入演示路由的这一帧仍可能读到上一个项目的时长
-  // 能力；显式屏蔽 fallback，避免虚构时长被套用真实后端限制而误报「不兼容」。demoMode 演示→
-  // 真实切换时先于 store 变为 false，currentProjectName 单独判一次兜住同一滞后窗口。
-  const durationOptions =
-    demoMode || isDemoProject(currentProjectName)
-      ? undefined
-      : localDurationOptions ?? resolvedDurationOptions;
+    enabled: capabilitiesEnabled,
+  });
+  const durationOptions = rawDurations ?? undefined;
 
   // 从任务队列派生 loading 状态（替代本地 state）：活跃 + 最新行胜出两条不变量下沉到 store selector
   const generatingCharacterNames = useActiveResourceIds("character", currentProjectName);
@@ -202,13 +160,16 @@ export function StudioCanvasRouter() {
 
   // ---- Timeline action callbacks ----
   // These receive scriptFile from TimelineCanvas so they always use the active episode's script.
+  // 返回是否写入成功：本函数内部吞掉异常并转 toast，调用方（如 AdReferenceVideoCanvas
+  // 的镜头级编辑）靠返回值而非"是否抛出"判断能否清空本地草稿——不依赖此契约的调用方
+  // （TimelineCanvas / GridImageToVideoCanvas）按 void 用即可，多出的返回值不影响它们。
   const handleUpdatePrompt = useCallback(async (
     segmentId: string,
     fieldOrPatch: string | Record<string, unknown>,
     value?: unknown,
     scriptFile?: string,
-  ) => {
-    if (!currentProjectName) return;
+  ): Promise<boolean> => {
+    if (!currentProjectName) return false;
     const mode = currentProjectData?.content_mode ?? "narration";
     const patch =
       typeof fieldOrPatch === "string"
@@ -222,11 +183,25 @@ export function StudioCanvasRouter() {
       } else {
         await API.updateSegment(currentProjectName, segmentId, { script_file: scriptFile, ...patch });
       }
-      await refreshProject();
+      // 仅在本地 store 已同步成功时报告成功：PATCH 已落库但刷新失败/取消时 store
+      // 仍是旧剧本，此时报告成功会让调用方清空草稿却回显旧值——与 handleMoveShot 同一契约。
+      return await refreshProject();
     } catch (err) {
       useAppStore.getState().pushToast(tRef.current("update_prompt_failed", { message: errMsg(err) }), "error");
+      return false;
     }
   }, [currentProjectName, currentProjectData, refreshProject]);
+
+  // 不走 voidPromise（见其 JSDoc）：ShotDetail.handleSave / handleRefsSave 靠
+  // await 这个回调维持保存中状态——真正要丢弃的只是布尔返回值，等待本身必须
+  // 原样保留。TimelineCanvas 与 GridImageToVideoCanvas 均不消费返回值，共用
+  // 同一适配回调。
+  const awaitedUpdatePrompt = useCallback(
+    async (...args: Parameters<typeof handleUpdatePrompt>) => {
+      await handleUpdatePrompt(...args);
+    },
+    [handleUpdatePrompt],
+  );
 
   // ad 镜头重排：把目标镜头向前/向后移动一位，提交整列全排列。
   // 返回是否移动成功，供编辑器把选中态跟随到镜头的新位置。
@@ -545,7 +520,10 @@ export function StudioCanvasRouter() {
     void handleGenerateProduct(...args).catch(console.error);
   }, [handleGenerateProduct]);
 
-  if (!currentProjectName) {
+  // `currentProjectName` 在详情到达前就已落地（见 router.tsx 首屏加载的注释），
+  // 仅查它会在深链（/characters 等）直接打开或详情较慢时把空集合渲染成可交互的
+  // 「空项目」页面；`projectDetailLoading` 才是详情是否已到达的信号。
+  if (!currentProjectName || projectDetailLoading) {
     return (
       <div className="flex h-full items-center justify-center text-gray-500">
         {t("loading_placeholder")}
@@ -694,6 +672,10 @@ export function StudioCanvasRouter() {
                     canEditTitle={Boolean(episode?.script_file)}
                     shots={script?.content_mode === "ad" ? script.shots : []}
                     hasScript={Boolean(script)}
+                    scriptFile={scriptFile ?? undefined}
+                    // 其余画布的演示只读靠组件内部 useDemoWorkbench() 自行收口；本画布未读取
+                    // demoMode（未提供 onUpdatePrompt 时自行降级为纯文本），故在调用点显式门控。
+                    onUpdatePrompt={demoMode ? undefined : handleUpdatePrompt}
                   />
                 ) : mode === "reference_video" ? (
                   <ReferenceVideoCanvas
@@ -722,7 +704,7 @@ export function StudioCanvasRouter() {
                     scriptFile={scriptFile ?? undefined}
                     projectData={currentProjectData}
                     durationOptions={durationOptions}
-                    onUpdatePrompt={handleUpdatePrompt}
+                    onUpdatePrompt={awaitedUpdatePrompt}
                     onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
                     onGenerateVideo={voidPromise(handleGenerateVideo)}
                     onGenerateNarration={voidPromise(handleGenerateNarration)}
@@ -748,7 +730,7 @@ export function StudioCanvasRouter() {
                     scriptFile={scriptFile ?? undefined}
                     projectData={currentProjectData}
                     durationOptions={durationOptions}
-                    onUpdatePrompt={handleUpdatePrompt}
+                    onUpdatePrompt={awaitedUpdatePrompt}
                     onMoveShot={isAd ? handleMoveShot : undefined}
                     onGenerateStoryboard={voidPromise(handleGenerateStoryboard)}
                     onGenerateVideo={voidPromise(handleGenerateVideo)}

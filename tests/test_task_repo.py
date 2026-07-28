@@ -7,6 +7,15 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from lib.db.base import Base
 from lib.db.repositories.task_repo import TaskRepository
+from lib.i18n import _ as translate_message
+from lib.task_failure import encode_failure, render_failure
+
+
+def _translator(locale: str):
+    def translate(key: str, **kwargs):
+        return translate_message(key, locale=locale, **kwargs)
+
+    return translate
 
 
 @pytest.fixture
@@ -96,25 +105,6 @@ class TestTaskRepository:
         assert character_edit_again["deduped"]
         assert character_edit_again["task_id"] == character_edit["task_id"]
 
-    async def test_event_sequence(self, db_session):
-        repo = TaskRepository(db_session)
-
-        task = await repo.enqueue(
-            project_name="demo",
-            task_type="video",
-            media_type="video",
-            resource_id="E1S01",
-            payload={},
-            script_file="ep1.json",
-        )
-        await repo.claim_next("video")
-        await repo.mark_failed(task["task_id"], "mock error")
-
-        events = await repo.get_events_since(last_event_id=0)
-        assert len(events) >= 3
-        types = [e["event_type"] for e in events]
-        assert types == ["queued", "running", "failed"]
-
     async def test_dependency_cascade_failure(self, db_session):
         repo = TaskRepository(db_session)
 
@@ -141,7 +131,84 @@ class TestTaskRepository:
 
         dep_task = await repo.get(second["task_id"])
         assert dep_task["status"] == "failed"
-        assert "blocked by failed dependency" in dep_task["error_message"]
+        assert dep_task["error_message"] == encode_failure(
+            "cascade_blocked_dependency", dependency_task_id=first["task_id"], reason="boom"
+        )
+
+    @pytest.mark.integration
+    async def test_cascade_with_long_structured_root_reason_stays_renderable(self, db_session):
+        """根任务的失败原因本身是带长 detail 的结构化编码时，级联包裹后仍须是合法可解析的 JSON。"""
+        repo = TaskRepository(db_session)
+
+        first = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S01",
+            payload={},
+            script_file="ep1.json",
+        )
+        second = await repo.enqueue(
+            project_name="demo",
+            task_type="storyboard",
+            media_type="image",
+            resource_id="E1S02",
+            payload={},
+            script_file="ep1.json",
+            dependency_task_id=first["task_id"],
+        )
+
+        await repo.claim_next("image")
+        long_reason = encode_failure("resume_expired_detail", detail="x" * 1900)
+        await repo.mark_failed(first["task_id"], long_reason)
+
+        dep_task = await repo.get(second["task_id"])
+        assert dep_task["status"] == "failed"
+        error_message = dep_task["error_message"]
+        assert error_message is not None
+        assert len(error_message) <= 2000
+
+        for locale in ("zh", "en", "vi"):
+            rendered = render_failure(error_message, _translator(locale))
+            assert rendered is not None
+            assert "[" not in rendered
+            assert "resume_expired_detail" not in rendered
+
+    @pytest.mark.integration
+    async def test_deep_dependency_cascade_stays_renderable(self, db_session):
+        """10 层依赖链级联失败：编码不应因深度嵌套被截断成非法 JSON。"""
+        repo = TaskRepository(db_session)
+
+        chain_length = 10
+        tasks = []
+        dependency_task_id = None
+        for i in range(chain_length):
+            task = await repo.enqueue(
+                project_name="demo",
+                task_type="storyboard",
+                media_type="image",
+                resource_id=f"E1S{i:02d}",
+                payload={},
+                script_file="ep1.json",
+                dependency_task_id=dependency_task_id,
+            )
+            tasks.append(task)
+            dependency_task_id = task["task_id"]
+
+        await repo.claim_next("image")
+        await repo.mark_failed(tasks[0]["task_id"], "boom" * 50)
+
+        deepest = await repo.get(tasks[-1]["task_id"])
+        assert deepest["status"] == "failed"
+        error_message = deepest["error_message"]
+        assert error_message is not None
+        assert len(error_message) <= 2000
+
+        for locale in ("zh", "en", "vi"):
+            rendered = render_failure(error_message, _translator(locale))
+            assert rendered is not None
+            assert "[" not in rendered
+            assert "cascade_blocked_dependency" not in rendered
 
     async def test_requeue_running_tasks(self, db_session):
         repo = TaskRepository(db_session)
@@ -602,11 +669,11 @@ class TestCancelCascadeAcrossCancelling:
         assert (await repo.get(c))["status"] == "cancelled"
         assert (await repo.get(c))["cancelled_by"] == "cascade"
 
-    async def test_cancel_cascade_event_data_carries_cancelled_by(self, db_session):
-        """前端通过 SSE 事件 data 中的 cancelled_by 字段区分级联取消。
+    async def test_cancel_cascade_task_rows_carry_cancelled_by(self, db_session):
+        """级联取消的下游任务与发起方在 cancelled_by 字段上须能区分。
 
-        本测试断言：finalize_cancelled(A) 触发的 B/C cancelled 事件 data 中
-        cancelled_by="cascade"；A 自己的事件 data cancelled_by="user"。
+        本测试断言：finalize_cancelled(A) 落库后，B/C 的 cancelled_by="cascade"；
+        A 自己的 cancelled_by="user"。
         """
         repo = TaskRepository(db_session)
         a, b, c = await self._chain_3(repo)
@@ -614,28 +681,22 @@ class TestCancelCascadeAcrossCancelling:
         await repo.cancel_task(a)
         await repo.finalize_cancelled(a)
 
-        events = await repo.get_events_since(last_event_id=0)
-        cancelled_events = [e for e in events if e["event_type"] == "cancelled"]
-        by_task = {e["task_id"]: e for e in cancelled_events}
+        assert (await repo.get(a))["cancelled_by"] == "user"
+        assert (await repo.get(b))["cancelled_by"] == "cascade"
+        assert (await repo.get(c))["cancelled_by"] == "cascade"
 
-        assert by_task[a]["data"]["cancelled_by"] == "user"
-        assert by_task[b]["data"]["cancelled_by"] == "cascade"
-        assert by_task[c]["data"]["cancelled_by"] == "cascade"
-
-    async def test_cancel_emits_each_event_at_most_twice(self, db_session):
-        """每个 task 的 cancelling/cancelled 事件不超过 1 次/各 1 次（不重复 emit）。"""
+    async def test_cancel_records_each_terminal_event_at_most_once(self, db_session):
+        """每个 task 的终态推送（project_events SSE 依赖的 terminal_events）不重复记账。"""
         repo = TaskRepository(db_session)
         a, b, c = await self._chain_3(repo)
         await repo.claim_next("image")
         await repo.cancel_task(a)
         await repo.finalize_cancelled(a)
 
-        events = await repo.get_events_since(last_event_id=0)
-        cancel_events = [e for e in events if e["event_type"] in ("cancelling", "cancelled")]
-        # 计数每个 task 的 cancel-related events
+        cancelled_events = [e for e in repo.terminal_events if e["status"] == "cancelled"]
         by_task: dict[str, int] = {}
-        for e in cancel_events:
+        for e in cancelled_events:
             tid = e["task_id"]
             by_task[tid] = by_task.get(tid, 0) + 1
         for tid in (a, b, c):
-            assert by_task.get(tid, 0) <= 2, f"{tid} 有重复 cancel 事件: {by_task.get(tid)}"
+            assert by_task.get(tid, 0) <= 1, f"{tid} 有重复终态推送: {by_task.get(tid)}"
