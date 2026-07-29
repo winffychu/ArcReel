@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from lib.image_backends.base import ImageCapability, ImageGenerationResult
-from lib.media_generator import MediaGenerator
+from lib.media_generator import MediaGenerator, segment_id_for
 
 
 class _FakeImageBackend:
@@ -158,6 +158,44 @@ def _build_generator(tmp_path: Path) -> MediaGenerator:
     return gen
 
 
+@pytest.mark.unit
+class TestSegmentIdFor:
+    """segment_id_for 是 image/video/audio 三条记账路径共用的单点判定函数。"""
+
+    @pytest.mark.parametrize(
+        "resource_type",
+        ["storyboards", "videos", "grids"],
+    )
+    def test_image_whitelist_hit(self, resource_type):
+        assert segment_id_for("image", resource_type, "E1S01") == "E1S01"
+
+    def test_image_whitelist_miss(self):
+        assert segment_id_for("image", "characters", "Alice") is None
+
+    @pytest.mark.parametrize(
+        "resource_type",
+        ["storyboards", "videos", "reference_videos"],
+    )
+    def test_video_whitelist_hit(self, resource_type):
+        assert segment_id_for("video", resource_type, "E1S01") == "E1S01"
+
+    def test_video_whitelist_miss(self):
+        # grids 只在图片记账白名单内，视频记账应落 None。
+        assert segment_id_for("video", "grids", "E1G1") is None
+
+    @pytest.mark.parametrize(
+        "resource_type",
+        ["audio", "storyboards", "characters"],
+    )
+    def test_audio_unconditional(self, resource_type):
+        assert segment_id_for("audio", resource_type, "E1S01") == "E1S01"
+
+    def test_unknown_call_type_raises(self):
+        # 未接入记账白名单的通道显式报错，避免 segment_id 静默丢失。
+        with pytest.raises(ValueError, match="unknown ledger channel"):
+            segment_id_for("text", "storyboards", "E1S01")
+
+
 class TestMediaGenerator:
     def test_get_output_path_and_invalid_type(self, tmp_path):
         gen = _build_generator(tmp_path)
@@ -217,6 +255,23 @@ class TestMediaGenerator:
         assert video_path2.name == "scene_E1S02.mp4"
         assert version2 == 2
         assert gen.ledger.started[-1]["call_type"] == "video"
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_generate_video_async_segment_id_by_resource_type(self, tmp_path):
+        """视频记账 segment_id 白名单覆盖 storyboards/videos/reference_videos，其余落 None。"""
+        gen = _build_generator(tmp_path)
+
+        await gen.generate_video_async(prompt="p", resource_type="videos", resource_id="E1S01")
+        assert gen.ledger.started[-1]["segment_id"] == "E1S01"
+
+        await gen.generate_video_async(prompt="p", resource_type="reference_videos", resource_id="E1U1")
+        assert gen.ledger.started[-1]["segment_id"] == "E1U1"
+
+        # 负向边界：白名单外的 resource_type 仍落 None——守住"白名单"语义，
+        # 避免日后被改成无条件透传而无人察觉。grids 只在图片记账白名单内。
+        await gen.generate_video_async(prompt="p", resource_type="grids", resource_id="E1G1")
+        assert gen.ledger.started[-1]["segment_id"] is None
 
     @pytest.mark.asyncio
     async def test_video_billed_duration_passed_to_finish_call(self, tmp_path):

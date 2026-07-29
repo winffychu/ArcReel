@@ -232,6 +232,35 @@ class TestAdGenerate:
 
         assert resp.status_code == 400
 
+    @pytest.mark.integration
+    def test_precheck_rounds_up_group_total(self, ad_client: TestClient, monkeypatch: pytest.MonkeyPatch):
+        """ad 与通用路径共用取档规则：分组成员镜头求和（3+2=5）非档位成员 → 按 8 秒申请，需确认。"""
+        from server.routers import reference_videos as router_mod
+        from server.services.reference_video_tasks import ProjectDurationContext
+
+        ctx = ProjectDurationContext(supported_durations=(4, 8, 12), resolution=None, provider_id="", model_name=None)
+        monkeypatch.setattr(router_mod, "resolve_project_duration_context", AsyncMock(return_value=ctx))
+        ad_client.post("/api/v1/projects/ad-demo/reference-videos/episodes/1/derive-units")
+
+        body = ad_client.get("/api/v1/projects/ad-demo/reference-videos/episodes/1/units/E1U1/duration-precheck").json()
+
+        assert body["needs_confirmation"] is True
+        assert body["script_duration"] == 5
+        assert body["request_duration"] == 8
+        assert body["adjustment"] == "up"
+
+    @pytest.mark.integration
+    def test_precheck_with_stale_index_409(self, ad_client: TestClient):
+        ad_client.post("/api/v1/projects/ad-demo/reference-videos/episodes/1/derive-units")
+        proj_dir: Path = ad_client.proj_dir  # type: ignore[attr-defined]
+        script = _read_script(ad_client)
+        script["shots"] = [s for s in script["shots"] if s["shot_id"] != "E1S2"]
+        (proj_dir / "scripts" / "episode_1.json").write_text(json.dumps(script, ensure_ascii=False), encoding="utf-8")
+
+        resp = ad_client.get("/api/v1/projects/ad-demo/reference-videos/episodes/1/units/E1U1/duration-precheck")
+
+        assert resp.status_code == 409
+
     def test_generate_with_stale_index_409(self, ad_client: TestClient):
         ad_client.post("/api/v1/projects/ad-demo/reference-videos/episodes/1/derive-units")
         proj_dir: Path = ad_client.proj_dir  # type: ignore[attr-defined]

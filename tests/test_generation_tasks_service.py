@@ -1177,20 +1177,6 @@ class TestGenerationTasks:
         )
         assert fake_generator.video_calls[0]["duration_seconds"] == 8
 
-    async def test_constrain_durations_by_resolution_falls_back(self):
-        """无声明 / 未登记型号 / 交集为空时返回原候选，不把候选清空。"""
-        constrain = generation_tasks.constrain_durations_by_resolution
-        # 已登记且有声明：按声明收窄（大小写不敏感）
-        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], "4K") == [8]
-        # 该分辨率无声明
-        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], "720p") == [4, 6, 8]
-        # 型号未登记（中转站 / 自定义供应商包装）
-        assert constrain("gemini-aistudio", "veo-3.1-via-relay", [4, 6, 8], "4k") == [4, 6, 8]
-        # 交集为空（声明自相矛盾，不该发生）：保留原候选而非清空
-        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6], "4k") == [4, 6]
-        # resolution 缺失
-        assert constrain("gemini-aistudio", "veo-3.1-generate-preview", [4, 6, 8], None) == [4, 6, 8]
-
     async def test_empty_supported_durations_guard_permissive(self, monkeypatch, tmp_path):
         """能力不可解析时 lane 交付空 supported_durations：守卫放行（不更坏），
         resolution 仍取自 lane 已解析出的值，不因能力缺失被改写。"""

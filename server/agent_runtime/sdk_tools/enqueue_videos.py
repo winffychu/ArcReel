@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,95 @@ from server.agent_runtime.sdk_tools._context import (
     tool_error,
     validate_script_filename,
 )
-from server.services.reference_video_tasks import resolve_max_unit_duration
+from server.services.reference_video_tasks import (
+    ProjectDurationContext,
+    precheck_unit,
+    resolve_max_unit_duration,
+    resolve_project_duration_context,
+)
+
+_CONFIRM_DURATION_SCHEMA_PROPERTY = {
+    "type": "boolean",
+    "description": (
+        "参考生视频时长确认：unit 申请时长与剧本编排不一致时首次调用不入队，"
+        "返回待确认清单；用户同意后带 confirm_duration=true 再次调用完成入队。"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class DurationConfirmationPending:
+    """待确认的 unit 时长清单：申请秒数与剧本编排不一致，尚未入队任何任务。"""
+
+    items: list[dict[str, Any]]
+
+
+def _duration_confirmation_response(pending: DurationConfirmationPending, log: list[str]) -> dict[str, Any]:
+    """把待确认清单连同本次已产生的 log 一并交给调用方转述。
+
+    log 携带的是同样影响本次生成范围的事实（如 scene_id 被忽略转整集、ad 派生出的 unit 数），
+    确认时一并呈现，用户才知道自己同意的是什么范围。
+    """
+    lines = [*log, "以下 unit 申请时长与剧本编排不一致，需先向用户确认，本次未入队任何任务："]
+    for item in pending.items:
+        longer_or_shorter = "更长" if item["adjustment"] == "up" else "更短"
+        lines.append(
+            f"- {item['unit_id']}：剧本总时长 {item['script_duration']}s，"
+            f"将申请 {item['request_duration']}s（成片{longer_or_shorter}）"
+        )
+    lines.append("用户同意后，带 confirm_duration=true 再次调用本工具完成入队。")
+    return {"content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+async def _pending_duration_confirmations(
+    *,
+    project: dict[str, Any],
+    units: list[dict[str, Any]],
+    skip_ids: set[str],
+    spec_for: Callable[[dict[str, Any]], TaskSpec],
+    ad_shots_for: Callable[[dict[str, Any]], list[dict[str, Any]]] | None,
+) -> list[dict[str, Any]]:
+    """收集本批将入队的 unit 中，申请时长与剧本编排不一致的清单。
+
+    项目视频能力（档位 + 分辨率）至多解析一次（:func:`resolve_project_duration_context`），
+    批内逐 unit 取档改用纯函数 :func:`precheck_unit`——避免整批 N 个 unit 各自触发一轮
+    DB 往返。解析推迟到第一个真正需要取档的 unit：整批都已完成或都被跳过时不触发任何 IO。
+
+    悬空索引 / 结构异常 / 空提示词的 unit 在此复用与 ``build_specs`` 同一份 spec 构造
+    （``spec_for``）判定可入队性并静默跳过，不在预检阶段重复报错——不合法的 unit
+    ``build_specs`` 阶段本就会拒绝，若仍纳入确认清单或触发 ctx 解析，会让批次卡在一个
+    注定不会入队的 unit 上，且申请时长的转述本身就是失实的（该 unit 根本不会被生成）。
+    """
+    ctx: ProjectDurationContext | None = None
+    items: list[dict[str, Any]] = []
+    for unit in units:
+        unit_id = str(unit.get("unit_id") or "")
+        if not unit_id or unit_id in skip_ids:
+            continue
+        try:
+            spec_for(unit)
+        except ValueError:
+            continue
+        try:
+            ad_shots = ad_shots_for(unit) if ad_shots_for else None
+        except ValueError:
+            continue
+        if ctx is None:
+            ctx = await resolve_project_duration_context(project)
+        try:
+            slot = precheck_unit(ctx, unit, ad_shots)
+        except ValueError:
+            continue
+        if slot.needs_confirmation:
+            items.append(
+                {
+                    "unit_id": unit_id,
+                    "script_duration": slot.total_seconds,
+                    "request_duration": slot.seconds,
+                    "adjustment": slot.adjustment,
+                }
+            )
+    return items
 
 
 def _get_video_prompt(item: dict[str, Any]) -> str:
@@ -169,6 +258,25 @@ def _build_video_specs(
     return specs, order_map
 
 
+def _reference_unit_spec(unit: dict[str, Any], script_filename: str) -> TaskSpec:
+    """单 unit 的 narration/drama TaskSpec 构造，供批量入队与时长预检共用同一份结构校验
+    （见 ADR-0001）——``TaskSpec.from_request`` 是「是否可入队」的唯一真相源，两处判断
+    不能各自维护一份、由此产生分歧（如预检放行了 build_specs 会拒绝的空提示词 unit）。
+    """
+    # 用 .get 归一化：缺失 unit_id 的坏数据（Agent 可裸写 script JSON）会被 from_request
+    # 当作空 resource_id 拒绝，而不是在此抛 KeyError 中断整批。
+    unit_id = str(unit.get("unit_id") or "")
+    if not unit.get("shots"):
+        raise ValueError("没有 shots")
+    return TaskSpec.from_request(
+        task_type="reference_video",
+        media_type="video",
+        resource_id=unit_id,
+        prompt=assemble_shots_text(unit["shots"]),
+        script_file=script_filename,
+    )
+
+
 def _build_reference_specs(
     *,
     units: list[dict[str, Any]],
@@ -180,26 +288,14 @@ def _build_reference_specs(
     specs: list[TaskSpec] = []
     order_map: dict[str, int] = {}
     for idx, unit in enumerate(units):
-        # 用 .get 归一化：缺失 unit_id 的坏数据（Agent 可裸写 script JSON）会被 from_request
-        # 当作空 resource_id 拒绝并走下面的跳过分支，而不是在此抛 KeyError 中断整批。
         unit_id = str(unit.get("unit_id") or "")
         if unit_id in skip_set:
             continue
-        if not unit.get("shots"):
-            log.append(f"⚠️  {unit_id} 没有 shots，跳过")
-            continue
-        # prompt 由 shots[*].text 拼接，经统一守卫点做空提示词结构校验（见 ADR-0001）；
-        # 任一 unit 不合法（空提示词、或 from_request 对空 resource_id 抛的裸 ValueError）
-        # 都跳过并告警，与「没有 shots」一致，不让一个坏 unit 中断整批。
-        # 注意 TaskSpecValidationError 是 ValueError 子类，捕 ValueError 同时覆盖两者。
+        # 任一 unit 不合法（没有 shots、空提示词、或 from_request 对空 resource_id 抛的
+        # 裸 ValueError）都跳过并告警，不让一个坏 unit 中断整批。TaskSpecValidationError
+        # 是 ValueError 子类，捕 ValueError 同时覆盖两者。
         try:
-            spec = TaskSpec.from_request(
-                task_type="reference_video",
-                media_type="video",
-                resource_id=unit_id,
-                prompt=assemble_shots_text(unit["shots"]),
-                script_file=script_filename,
-            )
+            spec = _reference_unit_spec(unit, script_filename)
         except ValueError as exc:
             log.append(f"⚠️  {unit_id} 入队校验未通过，跳过：{exc}")
             continue
@@ -289,6 +385,22 @@ async def _submit_with_checkpoint(
     return failures
 
 
+def _ad_reference_unit_spec(
+    script: dict[str, Any], unit: dict[str, Any], script_filename: str, style: str | None
+) -> TaskSpec:
+    """单 unit 的 ad TaskSpec 构造，供批量入队与时长预检共用同一份结构校验（同
+    ``_reference_unit_spec``）。成员镜头从 shots（内容唯一真相）水合后渲染 prompt。"""
+    unit_id = str(unit.get("unit_id") or "")
+    shots = resolve_ad_unit_shots(script, unit)
+    return TaskSpec.from_request(
+        task_type="reference_video",
+        media_type="video",
+        resource_id=unit_id,
+        prompt=render_ad_unit_prompt(shots, style=style),
+        script_file=script_filename,
+    )
+
+
 def _build_ad_reference_specs(
     *,
     script: dict[str, Any],
@@ -298,9 +410,8 @@ def _build_ad_reference_specs(
     skip_ids: list[str] | None,
     log: list[str],
 ) -> tuple[list[TaskSpec], dict[str, int]]:
-    """ad 派生索引 → TaskSpec。成员镜头从 shots（内容唯一真相）水合后渲染 prompt；
-    索引悬空 / 空画面提示词的 unit 跳过并告警，不让一个坏 unit 中断整批
-    （与 ``_build_reference_specs`` 同口径）。"""
+    """ad 派生索引 → TaskSpec。索引悬空 / 空画面提示词的 unit 跳过并告警，不让一个坏
+    unit 中断整批（与 ``_build_reference_specs`` 同口径）。"""
     skip_set = set(skip_ids or [])
     specs: list[TaskSpec] = []
     order_map: dict[str, int] = {}
@@ -309,14 +420,7 @@ def _build_ad_reference_specs(
         if unit_id in skip_set:
             continue
         try:
-            shots = resolve_ad_unit_shots(script, unit)
-            spec = TaskSpec.from_request(
-                task_type="reference_video",
-                media_type="video",
-                resource_id=unit_id,
-                prompt=render_ad_unit_prompt(shots, style=style),
-                script_file=script_filename,
-            )
+            spec = _ad_reference_unit_spec(script, unit, script_filename, style)
         except ValueError as exc:
             log.append(f"⚠️  {unit_id} 入队校验未通过，跳过：{exc}")
             continue
@@ -333,16 +437,29 @@ async def _generate_reference_units(
     resume: bool,
     log: list[str],
     build_specs: Callable[[list[dict[str, Any]], list[str], list[str]], tuple[list[TaskSpec], dict[str, int]]],
+    spec_for: Callable[[dict[str, Any]], TaskSpec],
+    project: dict[str, Any],
+    confirm_duration: bool,
     reuse_existing: Callable[[dict[str, Any]], bool] | None = None,
-) -> list[Path]:
-    """unit 批量生成的共享骨架：checkpoint 续传 + 已产出扫描 + 入队等待。
+    ad_shots_for: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
+) -> list[Path] | DurationConfirmationPending:
+    """unit 批量生成的共享骨架：时长确认 + checkpoint 续传 + 已产出扫描 + 入队等待。
 
     narration/drama（video_units 内容自包含）与 ad（reference_units 派生索引）
-    仅 spec 构造不同，经 ``build_specs(units, skip_ids, log)`` 注入。
+    仅 spec 构造不同，经 ``build_specs(units, skip_ids, log)`` 注入；``spec_for``
+    是同一份单 unit 构造逻辑，供时长预检判定可入队性，与 ``build_specs`` 不能有
+    第二份校验口径。ad 的每 unit 剧本时长需要成员镜头（``ad_shots_for``）才能
+    算出，narration/drama 不传。
 
     ``reuse_existing`` 决定磁盘上已存在的 ``{unit_id}.mp4`` 能否当作该 unit 的
     现行产物复用（None 表示仅凭文件存在即复用）。ad 派生索引在成员/参考集变化
     时会重置 unit 的 generated_assets，同名旧文件已不可信，须由该判定排除。
+
+    ``confirm_duration`` 为 false 时，若待入队 unit 中有申请时长与剧本编排不一致的
+    （见 :func:`server.services.reference_video_tasks.resolve_duration_slot`），本次
+    调用不产生任何任务，返回 :class:`DurationConfirmationPending` 供调用方转述给用户；
+    用户同意后调用方带 ``confirm_duration=True`` 重新调用完成入队（与 Web 端
+    ``duration-precheck`` 预检共用同一取档规则）。
     """
     project_dir = ctx.project_path
     ckpt_path = _episode_checkpoint_path(project_dir, episode)
@@ -369,6 +486,17 @@ async def _generate_reference_units(
                 completed.append(unit_id)
         elif unit_id in completed:
             completed.remove(unit_id)
+
+    if not confirm_duration:
+        pending = await _pending_duration_confirmations(
+            project=project,
+            units=units,
+            skip_ids=set(already_done),
+            spec_for=spec_for,
+            ad_shots_for=ad_shots_for,
+        )
+        if pending:
+            return DurationConfirmationPending(items=pending)
 
     specs, order_map = build_specs(units, already_done, log)
     if specs:
@@ -399,6 +527,7 @@ async def _run_reference_episode(
     script: dict[str, Any],
     script_filename: str,
     resume: bool,
+    confirm_duration: bool,
     log: list[str],
 ) -> dict[str, Any]:
     """Run reference_video-mode generation and format the tool response.
@@ -411,7 +540,8 @@ async def _run_reference_episode(
     units = script.get("video_units") or []
     if not units:
         raise ValueError(f"第 {episode} 集 video_units 为空：{script_filename}")
-    paths = await _generate_reference_units(
+    project = ctx.pm.load_project(ctx.project_name)
+    result = await _generate_reference_units(
         ctx=ctx,
         units=units,
         episode=episode,
@@ -420,8 +550,13 @@ async def _run_reference_episode(
         build_specs=lambda u, skip, lg: _build_reference_specs(
             units=u, script_filename=script_filename, skip_ids=skip, log=lg
         ),
+        spec_for=lambda u: _reference_unit_spec(u, script_filename),
+        project=project,
+        confirm_duration=confirm_duration,
     )
-    header = f"第 {episode} 集参考视频生成完成，共 {len(paths)} 个 unit"
+    if isinstance(result, DurationConfirmationPending):
+        return _duration_confirmation_response(result, log)
+    header = f"第 {episode} 集参考视频生成完成，共 {len(result)} 个 unit"
     return {"content": [{"type": "text", "text": "\n".join([header, *log])}]}
 
 
@@ -430,6 +565,7 @@ async def _run_ad_reference_episode(
     ctx: ToolContext,
     script_filename: str,
     resume: bool,
+    confirm_duration: bool,
     log: list[str],
 ) -> dict[str, Any]:
     """ad + reference_video：先（重新）派生分组索引并持久化，再按 unit 批量直出。
@@ -452,7 +588,7 @@ async def _run_ad_reference_episode(
     log.append(f"已派生 {len(units)} 个 video_unit（连续镜头分组，索引已写入剧本）")
 
     style = project.get("style")
-    paths = await _generate_reference_units(
+    result = await _generate_reference_units(
         ctx=ctx,
         units=units,
         episode=episode,
@@ -466,11 +602,19 @@ async def _run_ad_reference_episode(
             skip_ids=skip,
             log=lg,
         ),
+        spec_for=lambda u: _ad_reference_unit_spec(
+            script, u, script_filename, style if isinstance(style, str) else None
+        ),
+        project=project,
+        confirm_duration=confirm_duration,
         # sync 把成员/参考集变化的 unit 重置为待生成；旧同名产物不可复用，
         # 仅 generated_assets 仍指向产物的 unit 才按磁盘文件跳过
         reuse_existing=lambda u: bool(get_generated_assets(u).get("video_clip")),
+        ad_shots_for=lambda u: resolve_ad_unit_shots(script, u),
     )
-    header = f"参考直出生成完成，共 {len(paths)} 个 unit"
+    if isinstance(result, DurationConfirmationPending):
+        return _duration_confirmation_response(result, log)
+    header = f"参考直出生成完成，共 {len(result)} 个 unit"
     return {"content": [{"type": "text", "text": "\n".join([header, *log])}]}
 
 
@@ -487,6 +631,7 @@ def generate_video_episode_tool(ctx: ToolContext):
                     "description": "剧本文件名（如 episode_1.json），必须是纯文件名，禁止任何路径分隔符",
                 },
                 "resume": {"type": "boolean", "description": "是否从上次中断处继续"},
+                "confirm_duration": _CONFIRM_DURATION_SCHEMA_PROPERTY,
             },
             "required": ["script"],
         },
@@ -496,16 +641,28 @@ def generate_video_episode_tool(ctx: ToolContext):
         try:
             script_filename = validate_script_filename(args["script"])
             resume = bool(args.get("resume"))
+            confirm_duration = bool(args.get("confirm_duration"))
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
 
             if _is_reference_script(script):
                 return await _run_reference_episode(
-                    ctx=ctx, script=script, script_filename=script_filename, resume=resume, log=log
+                    ctx=ctx,
+                    script=script,
+                    script_filename=script_filename,
+                    resume=resume,
+                    confirm_duration=confirm_duration,
+                    log=log,
                 )
             if _is_ad_reference(ctx, script):
-                return await _run_ad_reference_episode(ctx=ctx, script_filename=script_filename, resume=resume, log=log)
+                return await _run_ad_reference_episode(
+                    ctx=ctx,
+                    script_filename=script_filename,
+                    resume=resume,
+                    confirm_duration=confirm_duration,
+                    log=log,
+                )
 
             episode = ProjectManager.resolve_episode_from_script(script, script_filename)
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
@@ -575,6 +732,7 @@ def generate_video_scene_tool(ctx: ToolContext):
                     "description": "剧本文件名（如 episode_1.json），必须是纯文件名，禁止任何路径分隔符",
                 },
                 "scene_id": {"type": "string", "description": "场景或片段 ID"},
+                "confirm_duration": _CONFIRM_DURATION_SCHEMA_PROPERTY,
             },
             "required": ["script", "scene_id"],
         },
@@ -583,6 +741,7 @@ def generate_video_scene_tool(ctx: ToolContext):
         try:
             script_filename = validate_script_filename(args["script"])
             scene_id = args["scene_id"]
+            confirm_duration = bool(args.get("confirm_duration"))
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
@@ -592,14 +751,23 @@ def generate_video_scene_tool(ctx: ToolContext):
                     f"⚠️  reference_video 模式暂不支持单 unit 精确选择；scene_id={scene_id} 被忽略，转整集生成。"
                 ]
                 return await _run_reference_episode(
-                    ctx=ctx, script=script, script_filename=script_filename, resume=False, log=log
+                    ctx=ctx,
+                    script=script,
+                    script_filename=script_filename,
+                    resume=False,
+                    confirm_duration=confirm_duration,
+                    log=log,
                 )
             if _is_ad_reference(ctx, script):
                 ad_log: list[str] = [
                     f"⚠️  reference_video 模式暂不支持单 unit 精确选择；scene_id={scene_id} 被忽略，转整集生成。"
                 ]
                 return await _run_ad_reference_episode(
-                    ctx=ctx, script_filename=script_filename, resume=False, log=ad_log
+                    ctx=ctx,
+                    script_filename=script_filename,
+                    resume=False,
+                    confirm_duration=confirm_duration,
+                    log=ad_log,
                 )
 
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
@@ -667,7 +835,8 @@ def generate_video_all_tool(ctx: ToolContext):
                 "script": {
                     "type": "string",
                     "description": "剧本文件名（如 episode_1.json），必须是纯文件名，禁止任何路径分隔符",
-                }
+                },
+                "confirm_duration": _CONFIRM_DURATION_SCHEMA_PROPERTY,
             },
             "required": ["script"],
         },
@@ -676,15 +845,27 @@ def generate_video_all_tool(ctx: ToolContext):
         log: list[str] = []
         try:
             script_filename = validate_script_filename(args["script"])
+            confirm_duration = bool(args.get("confirm_duration"))
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
 
             if _is_reference_script(script):
                 return await _run_reference_episode(
-                    ctx=ctx, script=script, script_filename=script_filename, resume=False, log=log
+                    ctx=ctx,
+                    script=script,
+                    script_filename=script_filename,
+                    resume=False,
+                    confirm_duration=confirm_duration,
+                    log=log,
                 )
             if _is_ad_reference(ctx, script):
-                return await _run_ad_reference_episode(ctx=ctx, script_filename=script_filename, resume=False, log=log)
+                return await _run_ad_reference_episode(
+                    ctx=ctx,
+                    script_filename=script_filename,
+                    resume=False,
+                    confirm_duration=confirm_duration,
+                    log=log,
+                )
 
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
             content_mode = script.get("content_mode", "narration")
@@ -739,6 +920,7 @@ def generate_video_selected_tool(ctx: ToolContext):
                     "description": "场景或片段 ID 列表",
                 },
                 "resume": {"type": "boolean", "description": "是否从上次中断处继续"},
+                "confirm_duration": _CONFIRM_DURATION_SCHEMA_PROPERTY,
             },
             "required": ["script", "scene_ids"],
         },
@@ -751,6 +933,7 @@ def generate_video_selected_tool(ctx: ToolContext):
             # checkpoint hash 再单独排序（见下方 ``canonical_scene_ids``）。
             scene_ids: list[str] = list(dict.fromkeys(args["scene_ids"]))
             resume = bool(args.get("resume"))
+            confirm_duration = bool(args.get("confirm_duration"))
 
             project_dir = ctx.project_path
             script = ctx.pm.load_script(ctx.project_name, script_filename)
@@ -760,13 +943,24 @@ def generate_video_selected_tool(ctx: ToolContext):
                     f"⚠️  reference_video 模式暂不支持多 unit 精确选择；scene_ids={','.join(scene_ids)} 被忽略，转整集生成。"
                 )
                 return await _run_reference_episode(
-                    ctx=ctx, script=script, script_filename=script_filename, resume=resume, log=log
+                    ctx=ctx,
+                    script=script,
+                    script_filename=script_filename,
+                    resume=resume,
+                    confirm_duration=confirm_duration,
+                    log=log,
                 )
             if _is_ad_reference(ctx, script):
                 log.append(
                     f"⚠️  reference_video 模式暂不支持多 unit 精确选择；scene_ids={','.join(scene_ids)} 被忽略，转整集生成。"
                 )
-                return await _run_ad_reference_episode(ctx=ctx, script_filename=script_filename, resume=resume, log=log)
+                return await _run_ad_reference_episode(
+                    ctx=ctx,
+                    script_filename=script_filename,
+                    resume=resume,
+                    confirm_duration=confirm_duration,
+                    log=log,
+                )
 
             items, id_field, _chars, _scenes, _props = get_storyboard_items(script)
             content_mode = script.get("content_mode", "narration")
