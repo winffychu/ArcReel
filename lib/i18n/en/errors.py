@@ -4,6 +4,7 @@ MESSAGES = {
     "overview_ai_response_invalid": "The AI response could not be parsed into a project overview. Please retry or switch to a different model/provider",
     "overview_generation_failed": "Overview generation failed. Please retry later or switch to a different model/provider",
     "video_capabilities_unresolved": "Cannot resolve video model capabilities for project '{name}'; please check the provider configuration",
+    "video_backend_malformed": "Video model identifier '{value}' is malformed; expected \"provider/model\"",
     "scope_invalid": "scope must be full or current",
     "download_expired": "Download link expired, please re-export",
     "download_token_mismatch": "Download token does not match the target project",
@@ -79,8 +80,11 @@ MESSAGES = {
     "missing_filename": "Uploaded file is missing a filename",
     "unsupported_image_type": "Unsupported file type {ext}. Allowed types: {allowed}",
     "unsupported_video_type": "Unsupported video type {ext}. Allowed types: {allowed}",
+    "unsupported_audio_type": "Unsupported audio type {ext}. Allowed types: {allowed}",
     "upload_too_large": "Uploaded file exceeds the size limit ({max_mb} MB)",
     "invalid_image_file": "Invalid image file, could not be parsed",
+    "invalid_audio_file": "Invalid audio file, could not be parsed",
+    "audio_duration_out_of_range": "Audio duration must be between {min_seconds} and {max_seconds} seconds",
     "vision_model_required": "Text model {provider}/{model} does not support image input (vision) and cannot perform the {task} task; please select a vision-capable text model for the simple tier or default model in settings",
     "internal_server_error": "Internal server error, please try again later",
     "invalid_asset_type": "asset type must be character / scene / prop",
@@ -149,6 +153,14 @@ MESSAGES = {
     "capability_override_last_frame_unsupported": (
         "Endpoint {endpoint} of model {model_id} does not support last-frame generation; "
         "last_frame cannot be overridden to true"
+    ),
+    "capability_override_reference_audio_unsupported": (
+        "Endpoint {endpoint} of model {model_id} does not send reference audio; "
+        "reference_audio_mode cannot be overridden to direct"
+    ),
+    "capability_override_audio_pair_incoherent": (
+        "Model {model_id} must have max_reference_audio_count greater than 0 when reference audio is supported; "
+        "override reference_audio_mode to none to turn voice reference off"
     ),
     # Projects
     "unknown_style_template": "Unknown style template: {template_id}",
@@ -249,6 +261,11 @@ MESSAGES = {
     "video_end_image_requires_start_image": "Model {model} does not support a standalone last frame; also provide a first frame (first+last keyframes) or remove the last frame",
     "video_last_frame_requires_pro": "{provider}/{model} only supports first+last frame at the pro tier; switch to the pro tier or remove the last frame",
     "video_last_frame_unsupported": "{provider}/{model} does not support a last frame under the current configuration; generation aborted. Remove the shot's last frame, or switch to a model or tier that supports it",
+    "video_reference_audio_unsupported": "{provider}/{model} does not support reference audio; generation aborted. Remove the character's reference audio, or switch to a model that supports voice reference",
+    "video_reference_audio_exceeded": "Model {model} supports at most {limit} reference audio clips but received {count}; reduce the number of characters with reference audio",
+    "video_reference_audio_slots_insufficient": "Model {model} attaches each reference audio clip to a reference asset, but only {slots} reference assets are available for {count} clips; add reference images for those characters, or reduce the number of characters with reference audio",
+    "video_reference_audio_unreadable": "Model {model} has reference audio that is missing or unreadable; generation aborted: {names}; check the reference audio paths",
+    "video_reference_audio_format_unsupported": "Reference audio {name} has an unsupported format (only {supported}); use a different audio file",
     # Agent credentials
     "agent_preset_unknown": "Unknown preset provider: {preset_id}",
     "agent_base_url_required_custom": "base_url is required for custom configuration",

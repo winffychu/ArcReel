@@ -521,12 +521,20 @@ class API {
     });
   }
 
-  /** 三级解析（项目 > 系统设置 > 系统默认）后的视频模型能力。 */
+  /**
+   * 三级解析（项目 > 系统设置 > 系统默认）后的视频模型能力。
+   *
+   * `videoBackend`（"provider/model"）用于设置表单里尚未保存的候选模型：不传按已落盘配置
+   * 解析，传了则按该候选模型 × 本项目 generation_mode 解析。
+   */
   static async getVideoCapabilities(
     name: string,
-    options: { signal?: AbortSignal } = {}
+    options: { signal?: AbortSignal; videoBackend?: string } = {}
   ): Promise<VideoCapabilities> {
-    return this.request(`/projects/${encodeURIComponent(name)}/video-capabilities`, {
+    const qs = options.videoBackend
+      ? `?video_backend=${encodeURIComponent(options.videoBackend)}`
+      : "";
+    return this.request(`/projects/${encodeURIComponent(name)}/video-capabilities${qs}`, {
       signal: options.signal,
     });
   }
@@ -1171,6 +1179,19 @@ class API {
     );
     await throwIfNotOk(response, "删除文件失败");
     return response.json() as Promise<SuccessResponse>;
+  }
+
+  /**
+   * 删除角色参考音频样本（清空字段并移除文件）
+   */
+  static async deleteCharacterReferenceAudio(
+    projectName: string,
+    characterName: string
+  ): Promise<SuccessResponse> {
+    return this.request(
+      `/projects/${encodeURIComponent(projectName)}/characters/${encodeURIComponent(characterName)}/reference-audio`,
+      { method: "DELETE" }
+    );
   }
 
   // ==================== 草稿文件管理 ====================
