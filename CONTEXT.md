@@ -186,6 +186,22 @@ _Avoid_: tts、voice_synthesis。
 对说书模式每个 NarrationSegment 的 `novel_text`（小说原文）生成的一段语音，是 audio 媒体类型在本期的唯一产物。按 segment 一段，落地为音频文件，路径记在该 segment 的 `GeneratedAssets.narration_audio`。
 _Avoid_: dub（易与影视译制混淆）、TTS 音频（太泛）。
 
+**音色（voice）**：
+TTS 供应商内置的一组预设发音人，合成请求以 `voice` 参数携带其 id（如 DashScope 的 `Cherry`、OpenAI 的 `alloy`）。各 audio backend 以 `list_voices()` 交付自己的音色目录，目录内容一律取自供应商官方文档并在 `docs/` 下留有出处快照，不凭印象填写。解析产物随 audio lane 的 `voices` 交付（值，非 backend 实例，见 `docs/adr/0049`）。
+_Avoid_: 用 voice 指代 audio 媒体类型本身；把音色与「声音复刻（voice cloning）」混为一谈——前者选供应商预设，后者用参考音频克隆。
+
+**语音试听样本（voice sample）**：
+创作者手上没有现成音频时，用已配置的 TTS 后端合成的一段短音频，供试听后确认为角色的参考音频。独立 task_type `voice_sample`，落在 `audio/` 目录但用 `voice_sample__` 前缀与旁白 segment 隔离命名空间。它是**预览件**：确认前不写入角色资产，取消或关闭弹窗即不产生任何资产变更。
+_Avoid_: 与「旁白配音」混为一谈——旁白是成片素材，试听样本只是选音色的中间产物。
+
+**声音一致性档位（voice consistency）**：
+视频模型在跨片段保持人物音色上能做到什么程度的三级标识，由「模型有无音轨」×「项目 generation_mode」二维派生，全仓库唯一派生点是 `lib/config/resolver.py::derive_voice_consistency`。`native`＝参考生视频直传参考音频、音色由音频本身锁定；`soft`＝有音轨但只能靠文字描述引导音色；`none`＝真无声，不承载任何声音语义。soft/none 之分不看 `generate_audio` token 是否声明——该 token 语义是「开关可控」而非「有无音轨」，恒有声但开关不可控的供应商（AI Studio Veo、Grok）经 `model_has_audio_track` 单独识别为有音轨。
+_Avoid_: 用 `generate_audio` 的真假直接代指有无音轨。
+
+**声音描述声明段（Voice_Profiles）**：
+drama 视频提示词 YAML 顶部的集中声明段，形如 `Voice_Profiles: [{Speaker, Voice_Style}]`，由编排层从角色资产的 `voice_style` 机械派生——收录集合为「本场景 dialogue 的 speaker」∩「角色资产 `voice_style` 非空」，只出场不开口的角色不收录。剧本 JSON 与 step2 LLM 零承载：编排层是它唯一的来源（`lib/prompt_utils.py::build_drama_video_prompt`），故角色 `voice_style` 改动下次生成即生效。档位为 `none` 时不注入。
+_Avoid_: 与既有 `Dialogue` 条目混为一谈——前者声明音色、每 speaker 一条，后者是台词、按时序逐条。
+
 **"audio" 的三种含义（歧义警示）**：
 - **audio（媒体类型）** = 本表定义的 TTS 维度。
 - **`generate_audio`（能力/字段）** = 视频模型（Veo/Kling 等）**自带音轨**的开关，属 video 维度，与 TTS 无关。

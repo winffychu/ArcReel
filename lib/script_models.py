@@ -7,7 +7,7 @@ script_models.py - 剧本数据模型
 """
 
 import logging
-from typing import Annotated, ClassVar, Literal, get_args
+from typing import Annotated, Any, ClassVar, Literal, get_args
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, create_model, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -187,6 +187,10 @@ class GeneratedAssets(BaseModel):
     # 显式声明使其通过 extra="forbid" + 「不更坏」守卫；仅说书 segment 写入，drama/refvideo 恒 None。
     narration_audio: str | None = Field(default=None, description="旁白音频路径")
     status: Literal["pending", "storyboard_ready", "completed"] = Field(default="pending", description="生成状态")
+    # video_clip 写回时（apply_unit_video_assets 单一写点）机械戳生成时间；用于跟角色
+    # `voice_updated_at` 比较，判定该片段是否生成于当前参考音频设置之前。
+    # 缺省视为早于任何设置，落在「生成于设置之前」语义内。对 LLM 隐藏。
+    video_generated_at: SkipJsonSchema[str | None] = Field(default=None, description="视频生成完成时间（ISO8601 UTC）")
 
 
 def get_generated_assets(item: dict) -> dict:
@@ -913,6 +917,14 @@ def is_reference_script(script: dict) -> bool:
     真相源是项目/集级配置（``effective_mode``），不适用本谓词。
     """
     return script.get("generation_mode") == "reference_video"
+
+
+def resolve_content_mode(script: dict[str, Any], project: dict[str, Any]) -> str:
+    """剧本级 ``content_mode`` 缺失（存量 episode 未打戳）时回退到项目级配置，与
+    ``lib.data_validator._validate_episode_payload`` 已校验通过的既定口径一致——存量
+    episode 允许省略该字段、由项目值兜底，读侧（生成任务）不能另起一份更严格的判定。
+    """
+    return script.get("content_mode", project.get("content_mode", "narration"))
 
 
 # ============ 参考生视频 step1 结构化中间态 ============

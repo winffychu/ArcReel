@@ -9,6 +9,7 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from server.services.generation_tasks import (
     collect_product_references_for_names,
     get_project_manager,
 )
+from server.services.video_caps import project_video_caps
 
 logger = logging.getLogger(__name__)
 
@@ -231,7 +233,7 @@ async def resolve_project_duration_context(project: dict) -> ProjectDurationCont
     空档位下分辨率约束无意义。``max_duration`` 与 :func:`resolve_max_unit_duration`
     取自同一份能力解析结果，供需要现推分组的调用方复用而不再触发一次 IO。
     """
-    caps = await _project_video_caps(project, degraded_to="时长取档不施加档位约束")
+    caps = await project_video_caps(project, degraded_to="时长取档不施加档位约束")
     durations = tuple(int(d) for d in caps.get("supported_durations") or [])
     provider_id = str(caps.get("provider_id") or "")
     model = caps.get("model")
@@ -272,19 +274,6 @@ def precheck_unit(ctx: ProjectDurationContext, unit: dict, ad_shots: list[dict] 
     return resolve_duration_slot(unit_script_duration(unit, ad_shots), durations)
 
 
-async def _project_video_caps(project: dict, *, degraded_to: str) -> dict:
-    """项目视频后端的 model 粒度能力；解析失败返回空 dict，由调用方各自降级。
-
-    ``degraded_to`` 只用于日志，说明这次解析失败会让调用方退化成什么行为。
-    """
-    try:
-        resolver = ConfigResolver(async_session_factory)
-        return await resolver.video_capabilities_for_project(project)
-    except (ValueError, SQLAlchemyError) as exc:
-        logger.info("无法解析 video_capabilities，%s：%s", degraded_to, exc)
-        return {}
-
-
 async def _project_video_resolution(project: dict, provider_id: str, model_id: str | None) -> str | None:
     """项目视频后端实际下发的分辨率；解析失败返回 None（该条约束随之不收窄）。
 
@@ -310,7 +299,7 @@ async def resolve_max_unit_duration(project: dict) -> int | None:
     model 粒度 ``max_duration``）；解析失败返回 None——分组退化为仅按镜头数
     切分，超长 unit 交由执行层取档 + warning 兜底，不阻塞派生。
     """
-    caps = await _project_video_caps(project, degraded_to="派生分组不施加时长上限")
+    caps = await project_video_caps(project, degraded_to="派生分组不施加时长上限")
     max_duration = caps.get("max_duration")
     return int(max_duration) if max_duration else None
 
@@ -576,7 +565,14 @@ async def execute_reference_video_task(
     )
 
 
-def apply_unit_video_assets(script: dict, resource_id: str, *, video_uri: str | None, thumb_rel: str | None) -> None:
+def apply_unit_video_assets(
+    script: dict,
+    resource_id: str,
+    *,
+    video_uri: str | None,
+    thumb_rel: str | None,
+    generated_at: str | None = None,
+) -> None:
     """在剧本 dict 上写回 unit.generated_assets（video_clip / video_uri / video_thumbnail / status）。
 
     生成 finalize 与版本还原共用，保证两条路径写出的字段口径一致。unit 在
@@ -586,6 +582,9 @@ def apply_unit_video_assets(script: dict, resource_id: str, *, video_uri: str | 
     已删除文件。写回失败必须让调用方可见、finalize 不能在剧本未更新时静默成功，
     且两种失败要可区分：unit 不存在抛 KeyError（还原侧跨集同步把它当正常跳过），
     unit 列表结构损坏抛 ScriptEditError（还原侧按脏脚本 warning 降级）。
+
+    ``generated_at`` 缺省戳当前时间（生成 finalize）；版本还原传入被还原版本的入库时间，
+    使「片段是否早于当前参考音频设置」按还原回来的旧内容成立，而不是被还原动作洗成最新。
     """
     unit_lists = [script.get(key) for key in ("video_units", "reference_units")]
     candidates = [units for units in unit_lists if isinstance(units, list)]
@@ -599,6 +598,7 @@ def apply_unit_video_assets(script: dict, resource_id: str, *, video_uri: str | 
             if not isinstance(ga, dict):
                 raise ScriptEditError("generated_assets 必须是 dict", key="script_edit_generated_assets_invalid")
             ga["video_clip"] = f"reference_videos/{resource_id}.mp4"
+            ga["video_generated_at"] = generated_at or datetime.now(UTC).isoformat()
             if video_uri:
                 ga["video_uri"] = video_uri
             else:

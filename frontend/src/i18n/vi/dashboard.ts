@@ -237,6 +237,39 @@ export default {
   'play_audio_sample': 'Phát',
   'pause_audio_sample': 'Tạm dừng',
   'delete_audio_sample': 'Xóa mẫu âm thanh',
+
+  // Tạo mẫu âm thanh tham chiếu bằng TTS
+  'voice_sample_action': 'Tạo bằng TTS',
+  'voice_sample_not_configured_hint': 'Vui lòng cấu hình nhà cung cấp âm thanh trong cài đặt trước',
+  'voice_sample_modal_title': 'Tạo mẫu giọng đọc tham chiếu',
+  'voice_sample_modal_desc':
+    'Chọn giọng đọc cho "{{name}}" và tạo một mẫu thử. Xác nhận để lưu làm âm thanh tham chiếu của nhân vật.',
+  'voice_sample_voice_label': 'Giọng đọc',
+  'voice_sample_voice_placeholder': 'Chọn giọng đọc',
+  'voice_sample_voice_loading': 'Đang tải danh sách giọng đọc…',
+  'voice_sample_no_voices': 'Nhà cung cấp âm thanh hiện tại không có giọng đọc nào để chọn',
+  'voice_sample_text_label': 'Văn bản mẫu',
+  'voice_sample_text_default':
+    'Xin chào, đây là một đoạn mẫu giọng đọc sẽ được dùng làm âm thanh tham chiếu của nhân vật, giúp giữ giọng nói nhất quán.',
+  'voice_sample_text_hint':
+    'Mẫu âm thanh phải dài 2-10 giây; văn bản quá dài sẽ khiến việc tạo thất bại.',
+  'voice_sample_generate': 'Tạo',
+  'voice_sample_generating': 'Đang tạo…',
+  'voice_sample_regenerate': 'Tạo lại',
+  'voice_sample_preview_label': 'Nghe thử',
+  'voice_sample_confirm': 'Xác nhận & lưu',
+  'voice_sample_confirming': 'Đang lưu…',
+  'voice_sample_confirm_success_toast': 'Đã lưu mẫu giọng đọc tham chiếu',
+  'voice_sample_task_failed': 'Tạo không thành công, vui lòng thử lại',
+  'voice_sample_task_submitted_toast': 'Đã gửi tác vụ tạo mẫu giọng đọc thử cho "{{name}}"',
+  'voice_sample_resource_busy': 'Nhân vật này đang bận với tác vụ khác, vui lòng thử lại sau',
+
+  'voice_legacy_banner_message_one':
+    'Âm thanh tham chiếu của nhân vật vừa được cập nhật. {{count}} đoạn đã tạo trước thay đổi này có thể khác giọng so với các đoạn mới; hãy tạo lại để khớp giọng hiện tại.',
+  'voice_legacy_banner_message_other':
+    'Âm thanh tham chiếu của nhân vật vừa được cập nhật. {{count}} đoạn đã tạo trước thay đổi này có thể khác giọng so với các đoạn mới; hãy tạo lại để khớp giọng hiện tại.',
+  'voice_legacy_banner_dismiss': 'Đã hiểu',
+  'voice_legacy_banner_dismiss_failed': 'Không thể đóng thông báo: {{error}}',
   'generate_design': 'Tạo thiết kế',
   'regenerate_design': 'Tạo lại thiết kế',
 
@@ -410,6 +443,7 @@ export default {
   'task_type_video': 'Video',
   'task_type_reference_video': 'Video tham chiếu',
   'task_type_tts': 'Giọng thuyết minh',
+  'task_type_voice_sample': 'Mẫu giọng thử',
   'task_type_grid': 'Lưới',
   'task_type_character': 'Nhân vật',
   'task_type_scene': 'Cảnh',
@@ -675,7 +709,7 @@ export default {
   'episode_mode_switch_keep_data': "Chuyển chế độ sẽ không xóa các đơn vị / cảnh hiện có — bạn có thể chuyển lại bất cứ lúc nào.",
   'episode_mode_switch_to_reference': 'Đã chuyển sang reference-to-video. Dữ liệu phân cảnh/lưới được giữ nguyên và sẽ hiện lại khi bạn chuyển về.',
   'episode_mode_switch_from_reference': 'Đã chuyển về phân cảnh/lưới. Các video_units chế độ tham chiếu được giữ lại để dùng sau.',
-  // ========== PR5 reference-video editor ==========
+  // ========== reference-video editor ==========
   'reference_editor_placeholder': 'Nhập prompt. Dùng dấu "Shot 1 (3s): ..." và @mentions cho nhân vật/cảnh/đạo cụ.',
   'reference_editor_aria_name': 'Prompt đơn vị',
   'reference_editor_unknown_mentions_label': 'Mention chưa đăng ký',
