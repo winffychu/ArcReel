@@ -29,6 +29,7 @@ from lib.reference_video.ad_units import (
     resolve_ad_unit_shots,
     sync_ad_reference_units,
 )
+from lib.reference_video.script_preview import build_script_preview
 from lib.resource_paths import resource_relative_path
 from lib.script_editor import ScriptEditError
 from lib.version_manager import VersionManager
@@ -38,6 +39,7 @@ from server.routers._reorder import full_permutation_error
 from server.services.generation_tasks import emit_generation_success_batch
 from server.services.reference_video_tasks import (
     _finalize_reference_video_unit,
+    default_unit_duration,
     precheck_unit,
     resolve_max_unit_duration,
     resolve_project_duration_context,
@@ -48,6 +50,7 @@ from server.services.upload_finalize import (
     save_uploaded_video_stream,
     validate_upload,
 )
+from server.services.video_caps import project_video_caps
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +67,14 @@ class ReferenceDto(BaseModel):
     name: str
 
 
+class ScriptPreviewRequest(BaseModel):
+    prompt: str = ""
+
+
 class AddUnitRequest(BaseModel):
     prompt: str
     references: list[ReferenceDto] = Field(default_factory=list)
-    duration_seconds: int | None = None
+    duration_seconds: int | None = Field(default=None, ge=1)
     transition_to_next: str = Field(default="cut", pattern=r"^(cut|fade|dissolve)$")
     note: str | None = None
 
@@ -193,20 +200,16 @@ def _build_unit_dict(
     unit_id: str,
     prompt: str,
     references: list[dict],
-    duration_override: int | None,
+    duration_seconds: int,
     transition: str,
     note: str | None,
 ) -> dict:
-    shots, _names, override = parse_prompt(prompt)
-    if override and duration_override is not None:
-        shots[0].duration = max(1, int(duration_override))
-    duration_total = sum(s.duration for s in shots)
+    shots, _names = parse_prompt(prompt)
     return {
         "unit_id": unit_id,
         "shots": [s.model_dump() for s in shots],
         "references": references,
-        "duration_seconds": duration_total,
-        "duration_override": override,
+        "duration_seconds": duration_seconds,
         "transition_to_next": transition,
         "note": note,
         "generated_assets": {
@@ -266,6 +269,14 @@ async def add_unit(
 ) -> dict[str, Any]:
     refs = [r.model_dump() for r in req.references]
 
+    # 时长是 unit 级单一真相：请求未给出时按项目能力解析默认档位（异步 IO 不进项目锁临界区）
+    duration_seconds = req.duration_seconds
+    if duration_seconds is None:
+        project, _script, _sf = _load_episode_script(project_name, episode, _t)
+        duration_seconds = default_unit_duration(
+            await resolve_project_duration_context(project), project, with_references=bool(refs)
+        )
+
     with _locked_episode_script(
         project_name, _episode_script_resolver(episode, _t, refs, require_ad=False), _t
     ) as script:
@@ -274,7 +285,7 @@ async def add_unit(
             unit_id=_next_unit_id(script, episode),
             prompt=req.prompt,
             references=refs,
-            duration_override=req.duration_seconds,
+            duration_seconds=int(duration_seconds),
             transition=req.transition_to_next,
             note=req.note,
         )
@@ -288,7 +299,7 @@ async def add_unit(
 class PatchUnitRequest(BaseModel):
     prompt: str | None = None
     references: list[ReferenceDto] | None = None
-    duration_seconds: int | None = None
+    duration_seconds: int | None = Field(default=None, ge=1)
     transition_to_next: str | None = Field(default=None, pattern=r"^(cut|fade|dissolve)$")
     note: str | None = None
 
@@ -335,16 +346,11 @@ async def patch_unit(
             unit["references"] = refs
 
         if req.prompt is not None:
-            shots, _mentions, override = parse_prompt(req.prompt)
-            if override and req.duration_seconds is not None:
-                shots[0].duration = max(1, int(req.duration_seconds))
+            shots, _mentions = parse_prompt(req.prompt)
             unit["shots"] = [s.model_dump() for s in shots]
-            unit["duration_seconds"] = sum(s.duration for s in shots)
-            unit["duration_override"] = override
-        elif req.duration_seconds is not None and unit.get("duration_override"):
-            unit["duration_seconds"] = max(1, int(req.duration_seconds))
-            if unit.get("shots"):
-                unit["shots"][0]["duration"] = unit["duration_seconds"]
+        # 时长与正文互不牵连：镜头不承载时长，改文案不改时长、改时长不动镜头
+        if req.duration_seconds is not None:
+            unit["duration_seconds"] = req.duration_seconds
 
         if req.transition_to_next is not None:
             unit["transition_to_next"] = req.transition_to_next
@@ -435,6 +441,47 @@ async def precheck_unit_duration(
         "script_duration": slot.total_seconds,
         "request_duration": slot.seconds,
         "adjustment": slot.adjustment,
+    }
+
+
+@router.post("/episodes/{episode}/script-preview")
+async def preview_script(
+    project_name: str,
+    episode: int,
+    req: ScriptPreviewRequest,
+    _user: CurrentUser,
+    _t: Translator,
+) -> dict[str, Any]:
+    """分镜文稿的读时派生预览：shots / references / utterances + 降级可见性 warning。
+
+    只读、不落盘——文稿是唯一真相，utterances 与 references 都是机械派生物。声音相关的
+    三条 warning 依赖项目当前视频后端的能力（``voice_consistency`` 与参考音频段数上限），
+    与执行层同一份解析出口；能力解析失败时按 ``soft`` 降级，只是少发这几条提示。
+    """
+    project, _script, _sf = _load_episode_script(project_name, episode, _t)
+    caps = await project_video_caps(project, degraded_to="解析预览不发声音相关提示")
+    preview = build_script_preview(
+        req.prompt,
+        project,
+        voice_consistency=str(caps.get("voice_consistency") or "soft"),
+        max_reference_audio=int(caps.get("max_reference_audio_count") or 0),
+        model_id=str(caps.get("model") or ""),
+        audio_requires_reference_image=bool(caps.get("reference_audio_per_image") or False),
+        max_reference_images=caps.get("max_reference_images"),
+    )
+    return {
+        "shots": [{"index": i, "text": s.text} for i, s in enumerate(preview.shots, start=1)],
+        "references": [r.model_dump() for r in preview.references],
+        "utterances": [
+            {
+                "shot_index": u.shot_index,
+                "kind": u.utterance.kind,
+                "speaker": u.utterance.speaker,
+                "text": u.utterance.text,
+            }
+            for u in preview.utterances
+        ],
+        "warnings": [{"key": w["key"], "message": _t(w["key"], **w["params"])} for w in preview.warnings],
     }
 
 

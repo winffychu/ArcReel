@@ -23,9 +23,7 @@ export const BUCKET_FIELD: Record<AssetKind, "characters" | "scenes" | "props"> 
 };
 
 export interface Shot {
-  /** 1-15s per shot */
-  duration: number;
-  /** Raw prompt text including @mentions */
+  /** Raw prompt text including @mentions — shots carry no duration; the unit does. */
   text: string;
 }
 
@@ -69,10 +67,8 @@ export interface ReferenceVideoUnit {
   shots: Shot[];
   /** Ordered — position defines [图N] index in the final prompt */
   references: ReferenceResource[];
-  /** Sum of shots[].duration; server-derived */
+  /** Unit duration in seconds — the single source of truth, sent to the provider as-is. */
   duration_seconds: number;
-  /** True when prompt has no Shot markers and user set duration manually */
-  duration_override: boolean;
   transition_to_next: TransitionType;
   note: string | null;
   generated_assets: UnitGeneratedAssets;
@@ -90,6 +86,30 @@ export interface ReferenceDurationPrecheck {
   /** 将向模型申请的档位秒数 */
   request_duration: number;
   adjustment: "exact" | "up" | "down" | "unconstrained";
+}
+
+/**
+ * 分镜文稿的读时派生结果——编辑器解析预览面板的内容源。
+ *
+ * 文稿是唯一真相：shots / references / utterances 都是机械派生物，不落盘。
+ * `warnings` 已按请求语言渲染成文本（`key` 保留供测试与埋点定位）。
+ */
+/** 1-based 镜头序号；台词归属镜头级，时序对位由归属给出。 */
+export type ScriptPreviewUtterance =
+  | { shot_index: number; kind: "dialogue"; speaker: string; text: string }
+  | { shot_index: number; kind: "voiceover"; speaker: null; text: string };
+
+export interface ScriptPreviewWarning {
+  key: string;
+  message: string;
+}
+
+export interface ScriptPreview {
+  shots: { index: number; text: string }[];
+  /** 顺序即参考图编号；规范台词行的 speaker 位不计入 */
+  references: ReferenceResource[];
+  utterances: ScriptPreviewUtterance[];
+  warnings: ScriptPreviewWarning[];
 }
 
 /** ad 派生分组的参考条目：比 ReferenceResource 多 product 类型（产品绝对优先）。 */
@@ -115,7 +135,7 @@ export interface AdReferenceUnit {
 /**
  * reference_video step1 结构化中间态（审核 gate 的可审 / 可改对象）。映射后端
  * lib/script_models.py 的 ReferenceStep1Unit / ReferenceStep1Draft：step1 定内容层
- * （unit 边界 + 各 shot 叙事文本与时长 + 派生 references），step2 视觉编排由用户确认后才触发。
+ * （unit 边界 + unit 时长 + 各 shot 叙事文本 + 派生 references），step2 视觉编排由用户确认后才触发。
  * references 为服务端从 shot 文本 @ 引用机械派生（首现顺序决定 [图N] 编号），编辑正文保存时重派生，
  * 故审阅界面只读展示。
  */
@@ -123,6 +143,8 @@ export interface ReferenceStep1Unit {
   unit_id: string;
   shots: Shot[];
   references: ReferenceResource[];
+  /** Unit duration in seconds — one generation call, one duration. */
+  duration_seconds: number;
 }
 
 export interface ReferenceStep1Draft {

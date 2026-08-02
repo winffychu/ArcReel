@@ -1,13 +1,10 @@
-"""参考生视频 executor。
-
-Spec: docs/superpowers/specs/2026-04-15-reference-to-video-mode-design.md §5.2
-"""
+"""参考生视频 executor。"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,7 +19,7 @@ from lib.db.base import DEFAULT_USER_ID
 from lib.generation_queue import get_generation_queue
 from lib.path_safety import safe_exists
 from lib.prompt_builders import append_product_fidelity_tail, append_video_negative_tail
-from lib.reference_video import assemble_shots_text, render_prompt_for_backend
+from lib.reference_video import assemble_shots_text, assemble_shots_text_for_render
 from lib.reference_video.ad_units import (
     render_ad_unit_prompt,
     render_reference_legend,
@@ -30,6 +27,11 @@ from lib.reference_video.ad_units import (
 )
 from lib.reference_video.duration_slots import DurationSlot, resolve_duration_slot
 from lib.reference_video.errors import MissingReferenceError
+from lib.reference_video.prompt_render import (
+    RenderedUnitPrompt,
+    render_unit_prompt,
+    resolve_reference_audio_paths,
+)
 from lib.script_editor import ScriptEditError
 from lib.script_models import ReferenceResource, ad_script_total_duration
 from lib.thumbnail import extract_video_thumbnail
@@ -91,21 +93,49 @@ def _resolve_unit_references(
     return resolved
 
 
-def _render_unit_prompt(unit: dict) -> str:
-    """从 unit.shots[*].text 拼接 prompt，用 shot_parser 把 @X 替成 [图N]，再追加反向尾词。
+def _render_unit_prompt(
+    unit: dict,
+    project: dict,
+    *,
+    voice_consistency: str,
+    max_reference_audio: int,
+    model_id: str,
+    audio_ready: Collection[str],
+    audio_requires_reference_image: bool = False,
+) -> RenderedUnitPrompt:
+    """把 unit 的书写文稿渲染成三段论 backend prompt（见 ``lib.reference_video.prompt_render``）。
+
+    画质/字幕/水印约束由渲染的第三段承担，本路径不追加反向尾词（``append_video_negative_tail``
+    只服务 ad 与图生视频路径）。
 
     空提示词的*结构校验*已上移到入队守卫点（``TaskSpec.from_request``），两条入队路径
     （WebUI / SDK）在入队时即拒绝空提示词。此处保留一道防御性空检查，因为参考生视频的
     提示词源是*可变*的 script 文件且执行期从新读取（队列 dedup 不看 payload，无法靠入队
     快照兜底）：若提示词在入队后被改空、或在途遗留任务漏过守卫，这道检查避免空提示词被
-    尾词追加成非空文本绕过 backend 的空值保护、白白消耗付费配额。
+    机器生成的第一/三段撑成非空文本绕过 backend 的空值保护、白白消耗付费配额。检查落在
+    *书写层文本*而非渲染结果上——三段论渲染恒产出非空第三段，渲染后已无从判别。
+
+    空检查用 ``assemble_shots_text``（不注入 header，空 shots 拼接结果仍为空）；渲染用
+    ``assemble_shots_text_for_render``（按数组位置重新注入规范 header），因为
+    ``parse_prompt`` 只认文本里的 header 切分镜头，而经解析预览面板编辑回写的 unit，
+    其 ``shots[*].text`` 普遍已不带 header——两个以上镜头裸拼接后会被重新解析成一个镜头，
+    丢失第二段的分镜结构。
     """
-    raw = assemble_shots_text(unit.get("shots") or [])
-    references = [ReferenceResource(type=r["type"], name=r["name"]) for r in (unit.get("references") or [])]
-    rendered = render_prompt_for_backend(raw, references)
-    if not rendered.strip():
+    shots = unit.get("shots") or []
+    if not assemble_shots_text(shots).strip():
         raise ValueError("reference video unit prompt is empty: all shots[*].text are blank")
-    return append_video_negative_tail(rendered)
+    references = [ReferenceResource(type=r["type"], name=r["name"]) for r in (unit.get("references") or [])]
+    return render_unit_prompt(
+        assemble_shots_text_for_render(shots),
+        project,
+        references,
+        voice_consistency=voice_consistency,
+        max_reference_audio=max_reference_audio,
+        model_id=model_id,
+        style=project.get("style"),
+        audio_ready=audio_ready,
+        audio_requires_reference_image=audio_requires_reference_image,
+    )
 
 
 def _apply_provider_constraints(
@@ -125,7 +155,7 @@ def _apply_provider_constraints(
     （model 粒度，单一真相源）；`max_refs` 为 None 表示不裁参考图，`supported_durations`
     为空表示能力不可解析、时长原样透传。
 
-    档位全集先按本次调用的条件收窄再取档（见 :func:`effective_reference_durations`）：参考图
+    档位全集先按该请求的条件收窄再取档（见 :func:`effective_reference_durations`）：参考图
     约束只在裁剪后**确实带图**时施加——通用单元允许空 references、ad 缺图会退化为纯文本，
     而 backend 同样只在 ``reference_images`` 非空时施加该约束。收窄用的是规范 registry
     provider id 而非 ``provider``（后者是 backend 族名，如 ark-agent-plan 族用 Ark backend，
@@ -173,15 +203,16 @@ def _apply_provider_constraints(
     return new_refs, new_duration, warnings
 
 
-def unit_script_duration(unit: dict, ad_shots: list[dict] | None) -> int:
-    """unit 的剧本编排时长（秒）。ad 取成员镜头求和，narration/drama 取 unit 字段。
+#: unit 时长缺值时的兜底秒数。执行层取档、入队前预检与新建 unit 的默认时长共用此口径，
+#: 避免用户确认的秒数与实际申请的秒数因各处各自兜底而不一致。
+FALLBACK_UNIT_DURATION = 8
 
-    执行层取档与入队前预检共用此口径（含缺值兜底 8 秒），避免用户确认的秒数与实际
-    申请的秒数因两处各自兜底而不一致。
-    """
+
+def unit_script_duration(unit: dict, ad_shots: list[dict] | None) -> int:
+    """unit 的剧本编排时长（秒）。ad 取成员镜头求和，narration/drama 取 unit 字段。"""
     if ad_shots is not None:
-        return ad_script_total_duration(ad_shots) or 8
-    return int(unit.get("duration_seconds") or 8)
+        return ad_script_total_duration(ad_shots) or FALLBACK_UNIT_DURATION
+    return int(unit.get("duration_seconds") or FALLBACK_UNIT_DURATION)
 
 
 def effective_reference_durations(
@@ -192,7 +223,7 @@ def effective_reference_durations(
     *,
     with_reference_images: bool,
 ) -> list[int]:
-    """参考视频路径实际可申请的时长档位：全集与本次调用条件的约束求交。
+    """参考视频路径实际可申请的时长档位：全集与该请求条件的约束求交。
 
     型号可能对「带参考图」与「按某分辨率下发」各自声明更窄的时长档位。按全集取档会选中
     执行期必然被拒的秒数（如 Veo 3.1 带参考图只接受 8 秒，5 秒剧本按全集取档得 6 秒），
@@ -272,6 +303,31 @@ def precheck_unit(ctx: ProjectDurationContext, unit: dict, ad_shots: list[dict] 
         else []
     )
     return resolve_duration_slot(unit_script_duration(unit, ad_shots), durations)
+
+
+def default_unit_duration(ctx: ProjectDurationContext, project: dict, *, with_references: bool = False) -> int:
+    """新建 unit 的默认时长（秒）：项目偏好 > 收窄后的最短档位 > 兜底。
+
+    档位按执行层同一套约束收窄（``effective_reference_durations``），使新建单元拿到的秒数
+    落在它真正被生成时能申请到的档位内。``with_references`` 须与 ``precheck_unit`` 对同一
+    unit 的判据同源（是否带参考图）。项目偏好不是当前模型的档位成员时（换模型后配置漂移）
+    不采信，退到收窄后档位里的最短值（自定义供应商声明的档位可能不按升序排列）；档位不可
+    解析时无从校验偏好是否可申请，直接退到 ``FALLBACK_UNIT_DURATION``，与执行层读不到
+    unit 时长时的兜底值同源。
+    """
+    durations = effective_reference_durations(
+        ctx.provider_id,
+        ctx.model_name,
+        list(ctx.supported_durations),
+        ctx.resolution,
+        with_reference_images=with_references,
+    )
+    if not durations:
+        return FALLBACK_UNIT_DURATION
+    preferred = project.get("default_duration")
+    if isinstance(preferred, int) and not isinstance(preferred, bool) and preferred in durations:
+        return preferred
+    return min(durations)
 
 
 async def _project_video_resolution(project: dict, provider_id: str, model_id: str | None) -> str | None:
@@ -522,13 +578,15 @@ async def execute_reference_video_task(
         await _persist_effective_duration(task_id, effective_duration)
 
     # 6. 渲染 prompt。ad：镜头文本 + 裁剪后参考的 [图N] 对照表 + 保真/反向尾词。
-    #    narration/drama：@→[图N] 替换——必须按 `constrained_refs` 的长度裁
-    #    `unit.references` 再渲染，保证 [图N] 的 1-based 索引与 backend 实际收到的
-    #    reference_images 长度严格对齐；否则裁剪后的 `@clipped_name` 会被替成
-    #    `[图N]` 指向不存在的图。
+    #    narration/drama：三段论渲染（`<X>@图片N` 绑定 + 声音声明 + 分镜段 + 约束包）——
+    #    必须按 `constrained_refs` 的长度裁 `unit.references` 再渲染，保证 `图片N` 的 1-based
+    #    索引与 backend 实际收到的 reference_images 长度严格对齐；否则裁剪后的
+    #    `@clipped_name` 会被绑到指向不存在的图的编号上。
     #    prompt 始终从执行期新读取的剧本重组（脚本可变 + 队列 dedup 不看 payload，
     #    用入队快照会丢失入队后对镜头文本的编辑）；入队 payload 里的 prompt 仅作守卫点的
     #    校验记录，执行期不使用。
+    reference_audio_files: list[Path] = []
+    reference_audio_targets: list[int] | None = None
     if is_ad:
         rendered_prompt = _render_ad_unit_prompt_for_backend(ad_shots or [], ad_entries, style=project.get("style"))
     else:
@@ -536,16 +594,47 @@ async def execute_reference_video_task(
         unit_refs = unit.get("references") or []
         if len(constrained_refs) < len(unit_refs):
             unit_for_prompt = {**unit, "references": unit_refs[: len(constrained_refs)]}
-        rendered_prompt = _render_unit_prompt(unit_for_prompt)
+        # 参考音频路径先解析再渲染：渲染层按「确实可用」判定绑定，`@音频N` 的编号与随请求
+        # 发出的段数因此严格等长（字段指向已删文件时不会留下指向不存在段的编号）。
+        audio_paths = await asyncio.to_thread(resolve_reference_audio_paths, project, project_path)
+        rendered = _render_unit_prompt(
+            unit_for_prompt,
+            project,
+            voice_consistency=video.voice_consistency,
+            max_reference_audio=video.max_reference_audio_count,
+            model_id=model_name,
+            audio_ready=audio_paths,
+            audio_requires_reference_image=video.reference_audio_per_image,
+        )
+        rendered_prompt = rendered.prompt
+        if video.reference_audio_per_image:
+            # backend（如 wan2.7-r2v）要求音频逐段挂在具体参考素材项上：渲染层已按
+            # audio_requires_reference_image 门控排除无参考图的 speaker，故
+            # audio_speaker_reference_index 里此时不应再有 None——仍按下标同时过滤两个列表
+            # 而非直接 zip 全量，是为了在渲染层与本处口径将来漂移时，两个列表始终等长同序，
+            # 不会因为其中一个多出未过滤的 None 项而导致音频与参考图下标错位、静默绑错角色。
+            paired = [
+                (audio_paths[name], idx)
+                for name, idx in zip(rendered.audio_speakers, rendered.audio_speaker_reference_index, strict=True)
+                if idx is not None
+            ]
+            reference_audio_files = [path for path, _ in paired]
+            reference_audio_targets = [idx for _, idx in paired]
+        else:
+            reference_audio_files = [audio_paths[name] for name in rendered.audio_speakers]
+        # 解析派生的降级提示与生成结果同屏可见：与解析预览面板同一批 {key, params} 条目。
+        warnings = [*warnings, *rendered.warnings]
 
     # 7. 直接把源路径交给咽喉层 generate_video_async —— 参考上传副本的压缩、降档梯子与 413 兜底
     #    统一由 MediaGenerator 负责（发完即删的临时字节），此处不再预压缩、不再管理临时文件，
-    #    避免双压。数量裁剪 + [图N] 索引对齐已在上游完成，咽喉层压缩 1:1 保序保数，职责不重叠。
+    #    避免双压。数量裁剪 + 参考图索引对齐已在上游完成，咽喉层压缩 1:1 保序保数，职责不重叠。
     output_path, version, _, video_uri = await generator.generate_video_async(
         prompt=rendered_prompt,
         resource_type="reference_videos",
         resource_id=resource_id,
         reference_images=constrained_refs,
+        reference_audio_files=reference_audio_files or None,
+        reference_audio_targets=reference_audio_targets,
         aspect_ratio=project.get("aspect_ratio", "9:16"),
         duration_seconds=effective_duration,
         resolution=resolution,

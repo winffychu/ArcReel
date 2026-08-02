@@ -13,6 +13,7 @@ import { UnitList } from "./UnitList";
 import { UnitRail } from "./UnitRail";
 import { UnitPreviewPanel } from "./UnitPreviewPanel";
 import { ReferenceVideoCard, unitPromptText } from "./ReferenceVideoCard";
+import { ScriptPreviewPanel } from "./ScriptPreviewPanel";
 import { deriveUnitStatus } from "./unit-status";
 import { ReferencePanel } from "./ReferencePanel";
 import { EpisodeHeader } from "./EpisodeHeader";
@@ -50,6 +51,16 @@ export interface ReferenceVideoCanvasProps {
   canEditTitle?: boolean;
   /** step2 剧本（scripts/episode_N.json）是否已生成——决定默认 tab（镜像 GridImageToVideoCanvas 的 hasScript 判定）。 */
   hasScript?: boolean;
+  /**
+   * unit 时长下拉的档位，来自模型能力声明（已按参考图约束与分辨率收窄）。供带 references
+   * 的 unit 使用；能力不可解析时为 undefined——此时不渲染下拉，只读展示当前秒数，不编造档位。
+   */
+  durationOptions?: number[];
+  /**
+   * 同一模型能力下、不叠加参考图约束的档位（仍按分辨率收窄）。供不带 references 的 unit
+   * 使用——参考图约束按 unit 生效，不能因同集内其它 unit 带图就收窄这类 unit 的可选档位。
+   */
+  durationOptionsNoReference?: number[];
 }
 
 const EMPTY_UNITS: readonly ReferenceVideoUnit[] = Object.freeze([]);
@@ -109,6 +120,8 @@ export function ReferenceVideoCanvas({
   onSaveTitle,
   canEditTitle,
   hasScript = true,
+  durationOptions,
+  durationOptionsNoReference,
 }: ReferenceVideoCanvasProps) {
   const { t } = useTranslation("dashboard");
 
@@ -176,6 +189,12 @@ export function ReferenceVideoCanvas({
     () => units.find((u) => u.unit_id === selectedUnitId) ?? null,
     [units, selectedUnitId],
   );
+
+  // 参考图约束按 unit 而非按集生效（同 lib.reference_video.precheck_unit 的
+  // bool(unit.references) 判据）：不带 references 的 unit 用不叠加该约束的档位，
+  // 否则同集内其它 unit 带图会连带把它的可选档位收窄到一个它本不受限的子集。
+  const effectiveDurationOptions =
+    selected && selected.references.length === 0 ? durationOptionsNoReference : durationOptions;
 
   // selectedUnitId is a global singleton; validate against current episode's units.
   useEffect(() => {
@@ -385,6 +404,25 @@ export function ReferenceVideoCanvas({
   }, [batchTargets, durationGate, makeEnqueueSerially, isUnitLocked, canEnqueueBatchUnit, t]);
 
   const onAdd = useCallback(() => void handleAdd(), [handleAdd]);
+
+  // 时长与正文分开提交：时长不是文本的一部分，改档位立即落盘，不牵连未保存的正文草稿。
+  const handleDurationChange = useCallback(
+    (unitId: string, seconds: number) => {
+      // 渲染期的禁用态未必最新（SSE / Agent 入队可能刚占用），提交时刻再复核一次
+      if (isUnitBusy(projectName, unitId)) {
+        useAppStore.getState().pushToast(t("reference_generate_busy"), "error");
+        return;
+      }
+      void patchUnit(projectName, episode, unitId, { duration_seconds: seconds })
+        .then(() => {
+          // 参考视频按申请秒数计价，改档位即改估价。落盘广播的是 reference_unit:updated，
+          // 不在 SSE 的生成动作白名单内、不会触发重拉，费用面板要在此处自行刷新。
+          useCostStore.getState().debouncedFetch(projectName);
+        })
+        .catch(toastError);
+    },
+    [patchUnit, projectName, episode, t],
+  );
   const onGenerateVoid = useCallback((id: string) => void handleGenerate(id), [handleGenerate]);
 
   const handlePromptChange = useCallback(
@@ -412,6 +450,29 @@ export function ReferenceVideoCanvas({
   }, [selected, drafts, projectName, episode]);
 
   const isDirty = !!(selected && dirtyMap[selected.unit_id]);
+
+  // 编辑器列内的两种视图：写文稿 / 看解析结果。解析预览是只读派生视图，与正文同一份
+  // 文本，故共用编辑器列的空间而非再占一栏（右栏留给成片预览）。
+  const [editorView, setEditorView] = useState<"script" | "parse">("script");
+  // 同名可以同时落在多个 bucket；优先级与后端 `resolve_references` 一致
+  // （character → scene → prop），先到先得、后面的不覆盖。
+  const mentionLookup = useMemo(() => {
+    // 无原型字典：`out["__proto__"] = kind` 在普通对象上会走继承的 setter、不落自有属性，
+    // 登记过的 `__proto__` 资产因此在高亮里显示为未登记，而后端照常解析。
+    const out: Record<string, "character" | "scene" | "prop"> = Object.create(null) as Record<
+      string,
+      "character" | "scene" | "prop"
+    >;
+    const claim = (name: string, kind: "character" | "scene" | "prop") => {
+      // hasOwn 而非 `in`：`toString` / `constructor` 等是合法资产名，`in` 命中原型链会让
+      // 真正登记的资产拿不到类型，前端高亮判它未登记、后端预览正常解析，两侧当场矛盾。
+      if (!Object.hasOwn(out, name)) out[name] = kind;
+    };
+    for (const name of Object.keys(project?.characters ?? {})) claim(name, "character");
+    for (const name of Object.keys(project?.scenes ?? {})) claim(name, "scene");
+    for (const name of Object.keys(project?.props ?? {})) claim(name, "prop");
+    return out;
+  }, [project?.characters, project?.scenes, project?.props]);
 
   const hasAnyDraft = Object.keys(drafts).length > 0;
 
@@ -751,7 +812,36 @@ export function ReferenceVideoCanvas({
                     </span>
                     <span className="inline-flex items-center gap-1 rounded border border-[var(--color-hairline-soft)] bg-[oklch(0.22_0.011_265_/_0.6)] px-2 py-0.5 text-[11.5px] text-[var(--color-text-2)]">
                       <Clock className="h-3 w-3" aria-hidden="true" />
-                      <span className="font-mono tabular-nums">{selected.duration_seconds}s</span>
+                      {effectiveDurationOptions && effectiveDurationOptions.length > 0 ? (
+                        <select
+                          aria-label={t("duration_selector_aria")}
+                          value={selected.duration_seconds}
+                          disabled={isUnitLocked(selected.unit_id)}
+                          title={
+                            isUnitLocked(selected.unit_id) ? t("duration_locked_generating") : undefined
+                          }
+                          onChange={(e) =>
+                            handleDurationChange(selected.unit_id, Number(e.target.value))
+                          }
+                          className="focus-ring cursor-pointer bg-transparent font-mono tabular-nums text-[var(--color-text-2)] disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {/* 已保存的越界值（换模型后档位收窄）留一项，避免下拉把它静默改写成别的秒数 */}
+                          {(effectiveDurationOptions.includes(selected.duration_seconds)
+                            ? effectiveDurationOptions
+                            : [...effectiveDurationOptions, selected.duration_seconds].sort(
+                                (a, b) => a - b,
+                              )
+                          ).map((seconds) => (
+                            <option key={seconds} value={seconds}>
+                              {t("duration_seconds_value_text", { value: seconds })}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="font-mono tabular-nums" title={t("duration_no_options")}>
+                          {selected.duration_seconds}s
+                        </span>
+                      )}
                     </span>
                     <span className="inline-flex items-center gap-1 rounded border border-[var(--color-hairline-soft)] bg-[oklch(0.22_0.011_265_/_0.6)] px-2 py-0.5 text-[11.5px] text-[var(--color-text-2)]">
                       <Scissors className="h-3 w-3" aria-hidden="true" />
@@ -858,16 +948,78 @@ export function ReferenceVideoCanvas({
                           onRemove={handleRemoveRef}
                           onAdd={handleAddRef}
                         />
-                        <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-3">
-                          <ReferenceVideoCard
-                            key={selected.unit_id}
-                            unit={selected}
-                            projectName={projectName}
-                            episode={episode}
-                            value={currentText}
-                            onChange={handlePromptChange}
-                          />
+                        <div
+                          role="tablist"
+                          aria-label={t("reference_editor_view_aria")}
+                          className="flex items-center gap-1 px-3 pt-2.5"
+                        >
+                          {(["script", "parse"] as const).map((view) => (
+                            <button
+                              key={view}
+                              type="button"
+                              role="tab"
+                              id={`reference-editor-view-tab-${view}`}
+                              aria-selected={editorView === view}
+                              aria-controls={`reference-editor-view-panel-${view}`}
+                              // 未选中的 tab 退出 Tab 序列，左右方向键在两者间移动：
+                              // tablist 的键盘约定是「Tab 进出控件组、方向键在组内切换」。
+                              tabIndex={editorView === view ? 0 : -1}
+                              onKeyDown={(e) => {
+                                if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                                e.preventDefault();
+                                const next = view === "script" ? "parse" : "script";
+                                setEditorView(next);
+                                document.getElementById(`reference-editor-view-tab-${next}`)?.focus();
+                              }}
+                              onClick={() => setEditorView(view)}
+                              className={`focus-ring rounded-md border px-2.5 py-1 text-[11.5px] font-medium transition-colors ${
+                                editorView === view
+                                  ? "border-[var(--color-accent)]/50 bg-[var(--color-accent-soft)] text-[var(--color-text)]"
+                                  : "border-[var(--color-hairline)] bg-[oklch(0.22_0.011_265_/_0.5)] text-[var(--color-text-3)] hover:text-[var(--color-text-2)]"
+                              }`}
+                            >
+                              {view === "script"
+                                ? t("reference_editor_view_script")
+                                : t("reference_editor_view_parse")}
+                            </button>
+                          ))}
                         </div>
+                        {editorView === "script" ? (
+                          <div
+                            id="reference-editor-view-panel-script"
+                            role="tabpanel"
+                            aria-labelledby="reference-editor-view-tab-script"
+                            className="flex min-h-0 flex-1 flex-col overflow-hidden p-3"
+                          >
+                            <ReferenceVideoCard
+                              key={selected.unit_id}
+                              unit={selected}
+                              projectName={projectName}
+                              episode={episode}
+                              value={currentText}
+                              onChange={handlePromptChange}
+                            />
+                          </div>
+                        ) : (
+                          <div
+                            id="reference-editor-view-panel-parse"
+                            role="tabpanel"
+                            aria-labelledby="reference-editor-view-tab-parse"
+                            // 解析预览是只读的，面板内没有可聚焦后代：滚动容器兼作焦点目标，
+                            // 键盘用户切到这个 tab 后才能用 PageDown / 方向键读到折线以下的内容
+                            // （WAI tabs：tabpanel 无可聚焦内容时自身取 tabindex="0"）。
+                            tabIndex={0}
+                            className="flex min-h-0 flex-1 flex-col overflow-y-auto"
+                          >
+                            <ScriptPreviewPanel
+                              key={selected.unit_id}
+                              projectName={projectName}
+                              episode={episode}
+                              text={currentText}
+                              lookup={mentionLookup}
+                            />
+                          </div>
+                        )}
                         {/* Editor bottom bar */}
                         <div className="flex flex-shrink-0 items-center gap-2 border-t border-[var(--color-hairline-soft)] bg-[oklch(0.18_0.010_265_/_0.5)] px-3.5 py-2">
                           <span
