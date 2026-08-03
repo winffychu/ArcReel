@@ -443,11 +443,11 @@ class TestVideoCapabilitiesBucketing:
     @pytest.mark.unit
     def test_generation_mode_maps_to_bucket(self):
         assert video_bucket_for_generation_mode("storyboard") == "i2v"
-        assert video_bucket_for_generation_mode("grid") == "i2v"
         assert video_bucket_for_generation_mode("reference_video") == "r2v"
-        # 缺省、未知值与非字符串脏数据一律落默认桶
+        # 缺省、未知值（含已退役的三值 grid）与非字符串脏数据一律落默认桶
         assert video_bucket_for_generation_mode(None) == "i2v"
         assert video_bucket_for_generation_mode("bogus") == "i2v"
+        assert video_bucket_for_generation_mode("grid") == "i2v"
         assert video_bucket_for_generation_mode(cast(str, ["reference_video"])) == "i2v"
 
     @pytest.mark.integration
@@ -938,6 +938,19 @@ class TestVoiceConsistency:
         """Sora 2 目录补 generate_audio 后派生 soft（不再因缺 token 误判 none）。"""
         caps = await self._caps({"video_backend": "openai/sora-2"})
         assert caps["voice_consistency"] == "soft"
+
+    @pytest.mark.unit
+    async def test_kling_v3_audio_models_are_soft(self):
+        """可灵 v3 系声明音频能力 → soft（注入 Voice_Profiles）。"""
+        for model_id in ("kling-v3", "kling-v3-omni"):
+            caps = await self._caps({"video_backend": f"kling/{model_id}"})
+            assert caps["voice_consistency"] == "soft"
+
+    @pytest.mark.unit
+    async def test_kling_turbo_true_silent_is_none(self):
+        """可灵 v2-5-turbo 无音频开关 → none。"""
+        caps = await self._caps({"video_backend": "kling/kling-v2-5-turbo"})
+        assert caps["voice_consistency"] == "none"
 
     async def test_minimax_true_silent_is_none(self):
         """MiniMax 真无声模型 → none。"""

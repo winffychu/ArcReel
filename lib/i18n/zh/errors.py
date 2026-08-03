@@ -162,7 +162,8 @@ MESSAGES = {
     "unknown_style_template": "未知的风格模版: {template_id}",
     "ad_only_field": "{field} 仅广告/短片项目（content_mode=ad）可用",
     "ad_no_default_duration": "广告/短片项目不支持默认时长，镜头时长按目标总时长规划",
-    "ad_grid_not_supported": "广告/短片项目不支持宫格生视频模式",
+    "ad_grid_not_supported": "广告/短片项目不支持分镜板（宫格）生视频",
+    "grid_storyboard_not_enabled": "项目未启用分镜板（宫格），无法生成宫格分镜",
     "ad_target_duration_required": "广告/短片项目必须设置目标总时长（正整数秒）",
     "project_id_not_editable": "项目创建后不支持修改 content_mode",
     "source_kind_not_editable": "项目创建后不支持修改源文件性质（source_kind）",
@@ -278,6 +279,7 @@ MESSAGES = {
     "video_reference_audio_slots_insufficient": "模型 {model} 的参考音频需逐段挂在参考素材上，当前只有 {slots} 个参考素材却收到 {count} 段音频；请为这些角色补齐参考图，或减少带参考音频的角色数量",
     "video_reference_audio_unreadable": "模型 {model} 有参考音频缺失或无法读取，已中止生成：{names}；请检查参考音频路径",
     "video_reference_audio_format_unsupported": "参考音频 {name} 的格式不受支持（仅支持 {supported}）；请更换音频文件",
+    "video_prompt_too_long": "{provider}/{model} 的提示词最多 {limit} 个字符，当前 {count} 个；超出部分会被供应商静默截断，已中止生成。请缩短提示词",
     # Agent credentials
     "agent_preset_unknown": "未知预设供应商: {preset_id}",
     "agent_base_url_required_custom": "自定义配置需要填写 base_url",

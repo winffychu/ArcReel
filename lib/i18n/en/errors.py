@@ -177,7 +177,8 @@ MESSAGES = {
     "unknown_style_template": "Unknown style template: {template_id}",
     "ad_only_field": "{field} is only available for ad/short-video projects (content_mode=ad)",
     "ad_no_default_duration": "Ad/short-video projects do not support a default duration; shot lengths are planned against the target duration",
-    "ad_grid_not_supported": "Ad/short-video projects do not support grid video generation",
+    "ad_grid_not_supported": "Ad/short-video projects do not support Grid Storyboard to Video",
+    "grid_storyboard_not_enabled": "Grid Storyboard is not enabled for this project",
     "ad_target_duration_required": "Ad/short-video projects require a target duration (positive integer seconds)",
     "project_id_not_editable": "content_mode cannot be modified after project creation",
     "source_kind_not_editable": "source_kind cannot be modified after project creation",
@@ -313,6 +314,7 @@ MESSAGES = {
     "video_reference_audio_slots_insufficient": "Model {model} attaches each reference audio clip to a reference asset, but only {slots} reference assets are available for {count} clips; add reference images for those characters, or reduce the number of characters with reference audio",
     "video_reference_audio_unreadable": "Model {model} has reference audio that is missing or unreadable; generation aborted: {names}; check the reference audio paths",
     "video_reference_audio_format_unsupported": "Reference audio {name} has an unsupported format (only {supported}); use a different audio file",
+    "video_prompt_too_long": "{provider}/{model} accepts prompts of at most {limit} characters but received {count}; the provider would silently truncate the excess, so generation was aborted. Shorten the prompt",
     # Agent credentials
     "agent_preset_unknown": "Unknown preset provider: {preset_id}",
     "agent_base_url_required_custom": "base_url is required for custom configuration",

@@ -177,7 +177,8 @@ MESSAGES = {
     "unknown_style_template": "Mẫu phong cách không xác định: {template_id}",
     "ad_only_field": "{field} chỉ khả dụng cho dự án quảng cáo/video ngắn (content_mode=ad)",
     "ad_no_default_duration": "Dự án quảng cáo/video ngắn không hỗ trợ thời lượng mặc định; thời lượng cảnh quay được lên kế hoạch theo tổng thời lượng mục tiêu",
-    "ad_grid_not_supported": "Dự án quảng cáo/video ngắn không hỗ trợ chế độ tạo video dạng lưới",
+    "ad_grid_not_supported": "Dự án quảng cáo/video ngắn không hỗ trợ tạo video từ bảng phân cảnh dạng lưới",
+    "grid_storyboard_not_enabled": "Dự án chưa bật bảng phân cảnh dạng lưới",
     "ad_target_duration_required": "Dự án quảng cáo/video ngắn bắt buộc phải có tổng thời lượng mục tiêu (số giây nguyên dương)",
     "project_id_not_editable": "content_mode không thể chỉnh sửa sau khi tạo dự án",
     "source_kind_not_editable": "source_kind không thể chỉnh sửa sau khi tạo dự án",
@@ -315,6 +316,7 @@ MESSAGES = {
     "video_reference_audio_slots_insufficient": "Mô hình {model} gắn mỗi đoạn âm thanh tham chiếu vào một tư liệu tham chiếu, nhưng chỉ có {slots} tư liệu cho {count} đoạn; hãy bổ sung ảnh tham chiếu cho các nhân vật đó, hoặc giảm số nhân vật có âm thanh tham chiếu",
     "video_reference_audio_unreadable": "Mô hình {model} có âm thanh tham chiếu bị thiếu hoặc không đọc được; đã hủy tạo: {names}; hãy kiểm tra đường dẫn âm thanh tham chiếu",
     "video_reference_audio_format_unsupported": "Âm thanh tham chiếu {name} có định dạng không được hỗ trợ (chỉ {supported}); hãy dùng tệp âm thanh khác",
+    "video_prompt_too_long": "{provider}/{model} chỉ chấp nhận câu lệnh tối đa {limit} ký tự nhưng nhận được {count}; phần vượt quá sẽ bị nhà cung cấp cắt bỏ âm thầm nên đã hủy tạo. Hãy rút ngắn câu lệnh",
     # Agent credentials
     "agent_preset_unknown": "Nhà cung cấp đặt sẵn không xác định: {preset_id}",
     "agent_base_url_required_custom": "Cấu hình tuỳ chỉnh yêu cầu base_url",
