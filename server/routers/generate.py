@@ -32,6 +32,7 @@ from lib.storyboard_sequence import (
     resolve_storyboard_image_ref,
 )
 from server.auth import CurrentUser
+from server.routers._validators import require_video_bucket_capability
 from server.services.generation_context import AudioLaneRequest, resolve_generation_context
 from server.services.image_edit_tasks import EDITABLE_RESOURCE_TYPES, resolve_current_image_rel
 
@@ -98,7 +99,7 @@ async def generate_storyboard(
     project_name: str,
     segment_id: str,
     req: GenerateStoryboardRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """
@@ -137,7 +138,7 @@ async def generate_storyboard(
         script_file=spec.script_file,
         payload=spec.payload,
         source="webui",
-        user_id=_user.id,
+        user_id=user.id,
     )
 
     return {
@@ -156,7 +157,7 @@ async def generate_video(
     project_name: str,
     segment_id: str,
     req: GenerateVideoRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """
@@ -165,9 +166,9 @@ async def generate_video(
     需要先有分镜图作为起始帧。生成由 GenerationWorker 异步执行。
     """
 
-    def _sync():
+    def _sync() -> dict:
         pm_local = get_project_manager()
-        pm_local.load_project(project_name)
+        project = pm_local.load_project(project_name)
         project_path = pm_local.get_project_path(project_name)
 
         # 与 worker 一致：优先读取 generated_assets.storyboard_image，回退默认路径。
@@ -194,8 +195,13 @@ async def generate_video(
             storyboard_file = project_path / "storyboards" / f"scene_{segment_id}.png"
         if not storyboard_file.is_file():
             raise BadRequestError("generate_storyboard_first", segment_id=segment_id)
+        return project
 
-    await asyncio.to_thread(_sync)
+    project = await asyncio.to_thread(_sync)
+
+    # 图生视频路径归 i2v 桶（docs/adr/0054）：解析闸预检让能力缺失 / 悬空引用在提交入口
+    # 即返回修复指引，而非任务面板里的异步失败。
+    await require_video_bucket_capability(project, "i2v")
 
     # 结构校验 + 构造经单一守卫点（与 SDK 入队同源，规则不分叉）。
     # duration 是能力维度，留待执行层在 provider 解析后校验（见 ADR-0001）。
@@ -218,7 +224,7 @@ async def generate_video(
         script_file=spec.script_file,
         payload=spec.payload,
         source="webui",
-        user_id=_user.id,
+        user_id=user.id,
     )
 
     return {
@@ -287,7 +293,7 @@ async def generate_tts(
     project_name: str,
     segment_id: str,
     req: GenerateTtsRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交单段旁白配音任务到队列，立即返回 task_id。
@@ -316,7 +322,7 @@ async def generate_tts(
         project_name=project_name,
         segment_id=segment_id,
         script_file=req.script_file,
-        user_id=_user.id,
+        user_id=user.id,
         provider_id=provider_id,
     )
 
@@ -332,7 +338,7 @@ async def generate_tts(
 async def generate_tts_batch(
     project_name: str,
     req: GenerateTtsRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """批量提交旁白配音任务：只入队缺少 narration_audio 且有小说原文的段（断点补缺）。"""
@@ -367,7 +373,7 @@ async def generate_tts_batch(
             project_name=project_name,
             segment_id=seg_id,
             script_file=req.script_file,
-            user_id=_user.id,
+            user_id=user.id,
             provider_id=provider_id,
         )
         task_ids.append(result["task_id"])
@@ -392,7 +398,7 @@ VOICE_SAMPLE_TEXT_MAX_LENGTH = 200
 
 
 @router.get("/projects/{project_name}/audio-backend/voices")
-async def get_audio_backend_voices(project_name: str, _user: CurrentUser, _t: Translator):
+async def get_audio_backend_voices(project_name: str, _t: Translator):
     """返回当前项目实际生效的 audio backend 音色枚举，供 TTS 试听弹窗选择音色。
 
     未配置任何 audio 供应商时返回 configured=false + 空列表，不 400——前端据此禁用
@@ -427,7 +433,7 @@ async def generate_character_voice_sample(
     project_name: str,
     name: str,
     req: GenerateVoiceSampleRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交角色 TTS 试听样本生成任务：文本/音色显式传入，不落回全局旁白配置。
@@ -474,7 +480,7 @@ async def generate_character_voice_sample(
         resource_id=spec.resource_id,
         payload=spec.payload,
         source="webui",
-        user_id=_user.id,
+        user_id=user.id,
         provider_id=provider_id,
     )
     return {
@@ -490,7 +496,6 @@ async def confirm_character_voice_sample(
     project_name: str,
     name: str,
     req: ConfirmVoiceSampleRequest,
-    _user: CurrentUser,
     _t: Translator,
 ):
     """把已生成、已试听的 TTS 样本提升为角色 reference_audio；不确认不落资产。
@@ -655,7 +660,7 @@ async def generate_character(
     project_name: str,
     char_name: str,
     req: GenerateCharacterRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交角色设计图生成任务到队列，立即返回 task_id。"""
@@ -664,7 +669,7 @@ async def generate_character(
         project_name=project_name,
         resource_name=char_name,
         prompt=req.prompt,
-        user_id=_user.id,
+        user_id=user.id,
         _t=_t,
     )
 
@@ -674,7 +679,7 @@ async def generate_scene(
     project_name: str,
     scene_name: str,
     req: GenerateSceneRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交场景设计图生成任务到队列，立即返回 task_id。"""
@@ -683,7 +688,7 @@ async def generate_scene(
         project_name=project_name,
         resource_name=scene_name,
         prompt=req.prompt,
-        user_id=_user.id,
+        user_id=user.id,
         _t=_t,
     )
 
@@ -693,7 +698,7 @@ async def generate_prop(
     project_name: str,
     prop_name: str,
     req: GeneratePropRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交道具设计图生成任务到队列，立即返回 task_id。"""
@@ -702,7 +707,7 @@ async def generate_prop(
         project_name=project_name,
         resource_name=prop_name,
         prompt=req.prompt,
-        user_id=_user.id,
+        user_id=user.id,
         _t=_t,
     )
 
@@ -712,7 +717,7 @@ async def generate_product(
     project_name: str,
     product_name: str,
     req: GenerateProductRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交产品标准参考图（product sheet）生成任务到队列，立即返回 task_id。"""
@@ -721,7 +726,7 @@ async def generate_product(
         project_name=project_name,
         resource_name=product_name,
         prompt=req.prompt,
-        user_id=_user.id,
+        user_id=user.id,
         _t=_t,
     )
 
@@ -749,7 +754,7 @@ async def _require_i2i_image_provider_configured(project: dict) -> str:
 async def edit_image(
     project_name: str,
     req: EditImageRequest,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ):
     """提交图片指令式编辑任务到队列，立即返回 task_id。
@@ -808,7 +813,7 @@ async def edit_image(
         resource_type=req.resource_type,
         payload=spec.payload,
         source="webui",
-        user_id=_user.id,
+        user_id=user.id,
         provider_id=provider_id,
     )
 

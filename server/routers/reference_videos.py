@@ -36,6 +36,7 @@ from lib.version_manager import VersionManager
 from server.auth import CurrentUser
 from server.error_handlers import script_edit_detail
 from server.routers._reorder import full_permutation_error
+from server.routers._validators import require_video_bucket_capability
 from server.services.generation_tasks import emit_generation_success_batch
 from server.services.reference_video_tasks import (
     _finalize_reference_video_unit,
@@ -228,7 +229,7 @@ def _build_unit_dict(
 
 
 @router.get("/episodes/{episode}/units")
-async def list_units(project_name: str, episode: int, _user: CurrentUser, _t: Translator) -> dict[str, Any]:
+async def list_units(project_name: str, episode: int, _t: Translator) -> dict[str, Any]:
     project, script, _sf = _load_episode_script(project_name, episode, _t)
     # ad 的 unit 是 shots 的派生索引（reference_units），未派生时为空列表；
     # 前端用 shot_ids 对照本地剧本水合展示，索引不复制镜头内容
@@ -241,7 +242,6 @@ async def list_units(project_name: str, episode: int, _user: CurrentUser, _t: Tr
 async def derive_units(
     project_name: str,
     episode: int,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     """（重新）派生 ad 项目的 video_unit 分组索引并持久化（仅 ad 开放）。
@@ -252,7 +252,7 @@ async def derive_units(
     project, _script, _sf = _load_episode_script(project_name, episode, _t)
     _require_ad_project(project, True, _t)
     # 供应商时长上限在锁外解析（异步 I/O 不进项目锁临界区）
-    max_unit_duration = await resolve_max_unit_duration(project)
+    max_unit_duration = await resolve_max_unit_duration(project, episode)
 
     with _locked_episode_script(project_name, _episode_script_resolver(episode, _t, require_ad=True), _t) as script:
         units = sync_ad_reference_units(script, episode=episode, max_unit_duration=max_unit_duration)
@@ -264,7 +264,6 @@ async def add_unit(
     project_name: str,
     episode: int,
     req: AddUnitRequest,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     refs = [r.model_dump() for r in req.references]
@@ -274,7 +273,7 @@ async def add_unit(
     if duration_seconds is None:
         project, _script, _sf = _load_episode_script(project_name, episode, _t)
         duration_seconds = default_unit_duration(
-            await resolve_project_duration_context(project), project, with_references=bool(refs)
+            await resolve_project_duration_context(project, episode), project, with_references=bool(refs)
         )
 
     with _locked_episode_script(
@@ -331,7 +330,6 @@ async def patch_unit(
     episode: int,
     unit_id: str,
     req: PatchUnitRequest,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     # references 存在性校验在解析器内、项目锁内进行，失败 raise 400
@@ -365,7 +363,6 @@ async def delete_unit(
     project_name: str,
     episode: int,
     unit_id: str,
-    _user: CurrentUser,
     _t: Translator,
 ) -> Response:
     with _locked_episode_script(project_name, _episode_script_resolver(episode, _t, require_ad=False), _t) as script:
@@ -387,7 +384,6 @@ async def reorder_units(
     project_name: str,
     episode: int,
     req: ReorderRequest,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     with _locked_episode_script(project_name, _episode_script_resolver(episode, _t, require_ad=False), _t) as script:
@@ -415,7 +411,6 @@ async def precheck_unit_duration(
     project_name: str,
     episode: int,
     unit_id: str,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     """入队前的时长取档预检：申请秒数与剧本编排不一致时前端需先向用户确认。
@@ -435,7 +430,7 @@ async def precheck_unit_duration(
         unit = _find_unit(script, unit_id, _t)
         ad_shots = None
 
-    slot = precheck_unit(await resolve_project_duration_context(project), unit, ad_shots)
+    slot = precheck_unit(await resolve_project_duration_context(project, episode), unit, ad_shots)
     return {
         "needs_confirmation": slot.needs_confirmation,
         "script_duration": slot.total_seconds,
@@ -449,17 +444,16 @@ async def preview_script(
     project_name: str,
     episode: int,
     req: ScriptPreviewRequest,
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     """分镜文稿的读时派生预览：shots / references / utterances + 降级可见性 warning。
 
     只读、不落盘——文稿是唯一真相，utterances 与 references 都是机械派生物。声音相关的
-    三条 warning 依赖项目当前视频后端的能力（``voice_consistency`` 与参考音频段数上限），
+    三条 warning 依赖该集视频后端的能力（``voice_consistency`` 与参考音频段数上限），
     与执行层同一份解析出口；能力解析失败时按 ``soft`` 降级，只是少发这几条提示。
     """
     project, _script, _sf = _load_episode_script(project_name, episode, _t)
-    caps = await project_video_caps(project, degraded_to="解析预览不发声音相关提示")
+    caps = await project_video_caps(project, degraded_to="解析预览不发声音相关提示", episode=episode)
     preview = build_script_preview(
         req.prompt,
         project,
@@ -493,7 +487,7 @@ async def generate_unit(
     project_name: str,
     episode: int,
     unit_id: str,
-    _user: CurrentUser,
+    user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     project, script, script_file = _load_episode_script(project_name, episode, _t)
@@ -525,6 +519,10 @@ async def generate_unit(
     except TaskSpecValidationError as exc:
         raise HTTPException(status_code=400, detail=_t(exc.code, **exc.params)) from exc
 
+    # 参考生视频路径全部镜头（含无参考图退化镜头）归 r2v 桶（docs/adr/0054）：解析闸预检
+    # 让能力缺失 / 悬空引用在提交入口即返回修复指引，而非任务面板里的异步失败。
+    await require_video_bucket_capability(project, "r2v")
+
     queue = get_generation_queue()
     result = await queue.enqueue_task(
         project_name=project_name,
@@ -534,7 +532,7 @@ async def generate_unit(
         payload=spec.payload,
         script_file=spec.script_file,
         source="webui",
-        user_id=_user.id,
+        user_id=user.id,
     )
     return {"task_id": result["task_id"], "deduped": result.get("deduped", False)}
 
@@ -544,7 +542,6 @@ async def upload_unit_video(
     project_name: str,
     episode: int,
     unit_id: str,
-    _user: CurrentUser,
     _t: Translator,
     file: UploadFile = File(...),
 ) -> dict[str, Any]:

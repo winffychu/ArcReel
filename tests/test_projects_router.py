@@ -23,6 +23,7 @@ class _OverviewProbe(BaseModel):
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import projects
+from tests.auth_deps import AUTH_DEPENDENCIES
 
 
 class _FakePM:
@@ -259,7 +260,8 @@ def _client(monkeypatch, fake_pm, fake_calc):
 
     app = FastAPI()
     app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
-    app.include_router(projects.router, prefix="/api/v1")
+    app.include_router(projects.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
+    app.include_router(projects.self_auth_router, prefix="/api/v1")
     register_error_handlers(app)
     return TestClient(app)
 
@@ -1006,6 +1008,53 @@ class TestProjectsRouter:
             assert data["default_text_backend"] == "gemini-aistudio/gemini-2.5"
             assert data["default_duration"] == 8
 
+    @pytest.mark.unit
+    def test_create_project_with_image_default_layer(self, tmp_path, monkeypatch):
+        """项目默认图片模型（default_image_backend）可在创建时写入，不必配桶。"""
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            resp = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "只配默认",
+                    "name": "img-default",
+                    "default_image_backend": "gemini-aistudio/nano-banana",
+                },
+            )
+            assert resp.status_code == 200
+            data = fake_pm.project_data["img-default"]
+            assert data["default_image_backend"] == "gemini-aistudio/nano-banana"
+            assert "image_provider_t2i" not in data
+            assert "image_provider_i2i" not in data
+
+    @pytest.mark.unit
+    def test_patch_image_default_layer_set_and_clear(self, tmp_path, monkeypatch):
+        """项目默认图片模型可设置 / 清除；格式非法与非图片模型均 400。"""
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+        with client:
+            updated = client.patch(
+                "/api/v1/projects/ready",
+                json={"default_image_backend": "gemini-aistudio/nano-banana"},
+            )
+            assert updated.status_code == 200
+            assert fake_pm.project_data["ready"]["default_image_backend"] == "gemini-aistudio/nano-banana"
+
+            cleared = client.patch("/api/v1/projects/ready", json={"default_image_backend": ""})
+            assert cleared.status_code == 200
+            assert "default_image_backend" not in fake_pm.project_data["ready"]
+
+            rejected = client.patch("/api/v1/projects/ready", json={"default_image_backend": "no-slash"})
+            assert rejected.status_code == 400
+
+            wrong_media = client.patch(
+                "/api/v1/projects/ready",
+                json={"default_image_backend": "gemini-aistudio/veo-3.1-generate-preview"},
+            )
+            assert wrong_media.status_code == 400
+
     def test_patch_text_tier_fields_set_and_clear(self, tmp_path, monkeypatch):
         """项目级档位 / 默认模型三字段可设置；空值 = 清除、继承全局。"""
         fake_pm = _FakePM(tmp_path)
@@ -1039,6 +1088,53 @@ class TestProjectsRouter:
             rejected = client.patch(
                 "/api/v1/projects/ready",
                 json={"text_backend_complex": "no-slash"},
+            )
+            assert rejected.status_code == 400
+
+    @pytest.mark.unit
+    def test_video_bucket_fields_create_patch_and_clear(self, tmp_path, monkeypatch):
+        """项目级视频桶键（video_provider_i2v/r2v）可创建时写入、PATCH 设置；空值 = 清除、回退默认层。"""
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            created = client.post(
+                "/api/v1/projects",
+                json={
+                    "title": "视频桶项目",
+                    "name": "vb-1",
+                    "video_provider_i2v": "minimax/MiniMax-Hailuo-2.3",
+                    "video_provider_r2v": "minimax/S2V-01",
+                },
+            )
+            assert created.status_code == 200
+            data = fake_pm.project_data["vb-1"]
+            assert data["video_provider_i2v"] == "minimax/MiniMax-Hailuo-2.3"
+            assert data["video_provider_r2v"] == "minimax/S2V-01"
+
+            updated = client.patch(
+                "/api/v1/projects/ready",
+                json={"video_provider_r2v": "openai/sora-2"},
+            )
+            assert updated.status_code == 200
+            assert fake_pm.project_data["ready"]["video_provider_r2v"] == "openai/sora-2"
+
+            cleared = client.patch(
+                "/api/v1/projects/ready",
+                json={"video_provider_r2v": ""},
+            )
+            assert cleared.status_code == 200
+            assert "video_provider_r2v" not in fake_pm.project_data["ready"]
+
+    @pytest.mark.unit
+    def test_video_bucket_field_rejects_non_video_model(self, tmp_path, monkeypatch):
+        fake_pm = _FakePM(tmp_path)
+        client = _client(monkeypatch, fake_pm, _FakeCalc())
+
+        with client:
+            rejected = client.patch(
+                "/api/v1/projects/ready",
+                json={"video_provider_i2v": "gemini-aistudio/gemini-3.1-flash-image-preview"},
             )
             assert rejected.status_code == 400
 
@@ -1514,6 +1610,41 @@ class TestGetVideoCapabilities:
         assert resolver_instance.video_capabilities_for_model.await_args.args[:2] == ("openai", "sora-2")
 
     @pytest.mark.integration
+    def test_episode_param_reaches_resolver(self, tmp_path, monkeypatch):
+        """带 episode 时集号传到 resolver：生成模式可被单集覆盖，按集查看的界面须同口径。"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        resolver_instance = MagicMock()
+        resolver_instance.video_capabilities = AsyncMock(return_value={"model": "saved-model"})
+        resolver_instance.video_capabilities_for_model = AsyncMock(return_value={"model": "candidate"})
+        monkeypatch.setattr(projects, "ConfigResolver", lambda _factory: resolver_instance)
+
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            assert client.get("/api/v1/projects/ready/video-capabilities", params={"episode": 3}).status_code == 200
+            resp = client.get(
+                "/api/v1/projects/ready/video-capabilities",
+                params={"video_backend": "openai/sora-2", "episode": 3},
+            )
+        assert resp.status_code == 200
+        assert resolver_instance.video_capabilities.await_args.args == ("ready", 3)
+        assert resolver_instance.video_capabilities_for_model.await_args.args[3] == 3
+
+    @pytest.mark.integration
+    def test_video_capabilities_without_episode_stays_project_level(self, tmp_path, monkeypatch):
+        """不带 episode 的调用（设置页等无集号上下文）仍按项目级解析。"""
+        from unittest.mock import AsyncMock, MagicMock
+
+        resolver_instance = MagicMock()
+        resolver_instance.video_capabilities = AsyncMock(return_value={"model": "saved-model"})
+        monkeypatch.setattr(projects, "ConfigResolver", lambda _factory: resolver_instance)
+
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            assert client.get("/api/v1/projects/ready/video-capabilities").status_code == 200
+        assert resolver_instance.video_capabilities.await_args.args == ("ready", None)
+
+    @pytest.mark.integration
     def test_malformed_video_backend_returns_400(self, tmp_path, monkeypatch):
         self._patch_resolver(monkeypatch, return_value={})
         client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
@@ -1566,6 +1697,29 @@ class TestGetVideoCapabilities:
             # 异常原文只进日志，不进用户可见响应（en/vi 界面不能混入未译英文原文）
             assert "model not found" not in detail
             assert detail == zh_errors.MESSAGES["video_capabilities_unresolved"].format(name="ready")
+
+    @pytest.mark.integration
+    def test_capability_bucket_error_returns_localized_400(self, tmp_path, monkeypatch):
+        """能力桶解析闸的报错转成结构化 400，带上修复指引，不被通用 422 文案吞掉。"""
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        self._patch_resolver(
+            monkeypatch,
+            side_effect=VideoBucketCapabilityError(
+                code="video_capability_missing_r2v",
+                capability="r2v",
+                provider_id="kling",
+                model_id="kling-v3",
+                message="video model kling/kling-v3 lacks the capability required by the r2v bucket",
+            ),
+        )
+        client = _client(monkeypatch, _FakePM(tmp_path), _FakeCalc())
+        with client:
+            resp = client.get("/api/v1/projects/ready/video-capabilities")
+            assert resp.status_code == 400
+            assert resp.json()["detail"] == zh_errors.MESSAGES["video_capability_missing_r2v"].format(
+                provider="kling", model="kling-v3"
+            )
 
 
 class TestModelSettingsApi:

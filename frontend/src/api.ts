@@ -26,6 +26,7 @@ import type {
   ProjectDeletedPayload,
   GetSystemConfigResponse,
   GetSystemVersionResponse,
+  ModelCandidatesResponse,
   OnboardingStatus,
   SystemConfigPatch,
   ApiKeyInfo,
@@ -227,8 +228,8 @@ export interface CreateProjectPayload {
   style_template_id?: string | null;
   video_backend?: string | null;
   image_backend?: string | null;
-  image_provider_t2i?: string | null;
-  image_provider_i2i?: string | null;
+  /** 项目默认图片模型。创建向导只暴露默认层（docs/adr/0054），能力桶留给项目设置页。 */
+  default_image_backend?: string | null;
   text_backend_simple?: string | null;
   text_backend_complex?: string | null;
   default_text_backend?: string | null;
@@ -438,6 +439,14 @@ class API {
     return this.request("/system/config");
   }
 
+  /**
+   * 能力桶下拉的候选数据源（docs/adr/0054）：默认层全量 + 每个桶按能力过滤后的模型列表。
+   * 与 getSystemConfig 的 options 同口径（同样剔除 hidden 模型），过滤只加在桶层。
+   */
+  static async getModelCandidates(): Promise<ModelCandidatesResponse> {
+    return this.request("/system/config/model-candidates");
+  }
+
   static async getSystemVersion(): Promise<GetSystemVersionResponse> {
     return this.request("/system/version");
   }
@@ -526,15 +535,19 @@ class API {
    * 三级解析（项目 > 系统设置 > 系统默认）后的视频模型能力。
    *
    * `videoBackend`（"provider/model"）用于设置表单里尚未保存的候选模型：不传按已落盘配置
-   * 解析，传了则按该候选模型 × 本项目 generation_mode 解析。
+   * 解析，传了则按该候选模型 × 本项目生效 generation_mode 解析。
+   *
+   * `episode` 用于按集查看的界面：生成模式可被单集覆盖，传集号则能力按该集生效模式解析，
+   * 与执行层同口径；不传只解析到项目级（设置页等无集号上下文的调用）。
    */
   static async getVideoCapabilities(
     name: string,
-    options: { signal?: AbortSignal; videoBackend?: string } = {}
+    options: { signal?: AbortSignal; videoBackend?: string; episode?: number } = {}
   ): Promise<VideoCapabilities> {
-    const qs = options.videoBackend
-      ? `?video_backend=${encodeURIComponent(options.videoBackend)}`
-      : "";
+    const params = new URLSearchParams();
+    if (options.videoBackend) params.set("video_backend", options.videoBackend);
+    if (options.episode !== undefined) params.set("episode", String(options.episode));
+    const qs = params.size > 0 ? `?${params.toString()}` : "";
     return this.request(`/projects/${encodeURIComponent(name)}/video-capabilities${qs}`, {
       signal: options.signal,
     });
@@ -853,10 +866,12 @@ class API {
   /** 读取该集 step1 结构化中间态 + 审核状态（供 web 渲染与编辑）。 */
   static async getScriptReview(
     projectName: string,
-    episode: number
+    episode: number,
+    options: { signal?: AbortSignal } = {}
   ): Promise<ScriptReviewState> {
     return this.request(
-      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review`
+      `/projects/${encodeURIComponent(projectName)}/episodes/${episode}/script-review`,
+      { signal: options.signal }
     );
   }
 

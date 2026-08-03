@@ -1,9 +1,17 @@
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from lib.config.resolver import ConfigResolver
+from lib.config.resolver import (
+    ConfigResolver,
+    VideoBucketCapabilityError,
+    caps_generation_mode,
+    constrain_durations_for_project,
+    resolve_raw_supported_durations,
+    video_bucket_for_generation_mode,
+)
 from lib.config.service import ProviderStatus
 from lib.db.base import Base
 
@@ -51,9 +59,6 @@ class _FakeConfigService:
 
     async def get_default_video_backend(self) -> tuple[str, str]:
         return ("gemini-aistudio", "veo-3.1-fast-generate-preview")
-
-    async def get_default_image_backend(self) -> tuple[str, str]:
-        return ("gemini-aistudio", "gemini-3.1-flash-image-preview")
 
     async def get_provider_config(self, provider: str) -> dict[str, str]:
         return {"api_key": f"key-{provider}"}
@@ -204,8 +209,9 @@ class TestDefaultBackends:
         finally:
             await engine.dispose()
 
-    async def test_default_image_backend_t2i_reads_dedicated_setting(self):
-        """新 setting key default_image_backend_t2i 优先于旧 default_image_backend。"""
+    @pytest.mark.unit
+    async def test_default_image_backend_t2i_bucket_overrides_default_layer(self):
+        """全局桶 default_image_backend_t2i 覆盖全局默认层 default_image_backend。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(
             settings={
@@ -216,8 +222,9 @@ class TestDefaultBackends:
         result = await resolver._resolve_default_image_backend(fake_svc, None, "t2i")
         assert result == ("ark", "stable-diffusion-3")
 
-    async def test_default_image_backend_t2i_falls_back_to_legacy(self):
-        """只设旧 default_image_backend，新 _t2i 未设时回退到旧值。"""
+    @pytest.mark.unit
+    async def test_default_image_backend_t2i_falls_back_to_default_layer(self):
+        """只设默认层 default_image_backend、t2i 桶未配时回退到默认层。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(
             settings={"default_image_backend": "grok/grok-2-image"},
@@ -225,8 +232,9 @@ class TestDefaultBackends:
         result = await resolver._resolve_default_image_backend(fake_svc, None, "t2i")
         assert result == ("grok", "grok-2-image")
 
-    async def test_default_image_backend_i2i_reads_dedicated_setting(self):
-        """对称测试 i2i：新 key default_image_backend_i2i 优先于旧 default_image_backend。"""
+    @pytest.mark.unit
+    async def test_default_image_backend_i2i_bucket_overrides_default_layer(self):
+        """对称测试 i2i：全局桶覆盖全局默认层。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(
             settings={
@@ -237,8 +245,9 @@ class TestDefaultBackends:
         result = await resolver._resolve_default_image_backend(fake_svc, None, "i2i")
         assert result == ("ark", "kolors-img2img")
 
-    async def test_default_image_backend_i2i_falls_back_to_legacy(self):
-        """只设旧 default_image_backend，_i2i 未设时回退到旧值。"""
+    @pytest.mark.unit
+    async def test_default_image_backend_i2i_falls_back_to_default_layer(self):
+        """只设默认层 default_image_backend、i2i 桶未配时回退到默认层。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(
             settings={"default_image_backend": "grok/grok-2-image"},
@@ -246,12 +255,13 @@ class TestDefaultBackends:
         result = await resolver._resolve_default_image_backend(fake_svc, None, "i2i")
         assert result == ("grok", "grok-2-image")
 
-    async def test_default_image_backend_t2i_explicit_empty_does_not_fall_back(self):
-        """split key 显式置为空字符串时，不应回退到 legacy default_image_backend。
+    @pytest.mark.unit
+    @pytest.mark.parametrize("capability", ["t2i", "i2i"])
+    async def test_default_image_backend_empty_bucket_falls_back_to_default_layer(self, capability: str):
+        """桶键为空字符串时回退默认层（docs/adr/0054）。
 
-        语义锁：用户主动把 default_image_backend_t2i="" 表示「不设默认 / 自动选择」，
-        必须走 _auto_resolve_backend；这里 ready_providers=[] 让 auto 路径抛错，
-        以此区分"走了 auto 路径"（期望）和"被 legacy 静默回退"（被锁住的 bug）。
+        语义锁：桶是可选覆盖，空值不再表示「不设默认 / 自动选择」。ready_providers=[] 让
+        自动推断路径抛错，以此区分「回退到默认层」（期望）与「跳到自动推断」。
         """
         factory, engine = await _make_session()
         try:
@@ -259,33 +269,24 @@ class TestDefaultBackends:
             fake_svc = _FakeConfigService(
                 settings={
                     "default_image_backend": "grok/grok-2-image",
-                    "default_image_backend_t2i": "",
+                    f"default_image_backend_{capability}": "",
                 },
                 ready_providers=[],
             )
             async with factory() as session:
-                with pytest.raises(ValueError, match="未找到可用的 image 供应商"):
-                    await resolver._resolve_default_image_backend(fake_svc, session, "t2i")
+                result = await resolver._resolve_default_image_backend(fake_svc, session, capability)
+            assert result == ("grok", "grok-2-image")
         finally:
             await engine.dispose()
 
-    async def test_default_image_backend_i2i_explicit_empty_does_not_fall_back(self):
-        """对称：default_image_backend_i2i="" 不应回退到 legacy。"""
-        factory, engine = await _make_session()
-        try:
-            resolver = ConfigResolver.__new__(ConfigResolver)
-            fake_svc = _FakeConfigService(
-                settings={
-                    "default_image_backend": "grok/grok-2-image",
-                    "default_image_backend_i2i": "",
-                },
-                ready_providers=[],
-            )
-            async with factory() as session:
-                with pytest.raises(ValueError, match="未找到可用的 image 供应商"):
-                    await resolver._resolve_default_image_backend(fake_svc, session, "i2i")
-        finally:
-            await engine.dispose()
+    @pytest.mark.unit
+    @pytest.mark.parametrize("capability", ["t2i", "i2i"])
+    async def test_default_image_backend_only_default_layer_covers_all_buckets(self, capability: str):
+        """只配 default_image_backend、两个桶都不配时，全部图片路径解析到该默认模型。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_image_backend": "grok/grok-2-image"})
+        result = await resolver._resolve_default_image_backend(fake_svc, None, capability)
+        assert result == ("grok", "grok-2-image")
 
 
 class TestProviderConfig:
@@ -428,6 +429,108 @@ class TestVideoBackendThreeLevelPriority:
         assert result == ("ark", "doubao-seedance-2-0-260128")
 
 
+class TestVideoCapabilitiesBucketing:
+    """读侧按 generation_mode 定桶：能力查询回答的是当前配置真正会执行的那个模型。"""
+
+    async def _caps(self, project: dict) -> dict:
+        factory, engine = await _make_session()
+        try:
+            with patch("lib.config.resolver.get_project_manager"):
+                return await ConfigResolver(factory).video_capabilities_for_project(project)
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.unit
+    def test_generation_mode_maps_to_bucket(self):
+        assert video_bucket_for_generation_mode("storyboard") == "i2v"
+        assert video_bucket_for_generation_mode("grid") == "i2v"
+        assert video_bucket_for_generation_mode("reference_video") == "r2v"
+        # 缺省、未知值与非字符串脏数据一律落默认桶
+        assert video_bucket_for_generation_mode(None) == "i2v"
+        assert video_bucket_for_generation_mode("bogus") == "i2v"
+        assert video_bucket_for_generation_mode(cast(str, ["reference_video"])) == "i2v"
+
+    @pytest.mark.integration
+    async def test_i2v_bucket_shadows_project_default(self):
+        """图生视频项目读 i2v 桶，遮蔽项目默认层。"""
+        caps = await self._caps(
+            {
+                "video_backend": "grok/grok-imagine-video",
+                "video_provider_i2v": "kling/kling-v3",
+                "generation_mode": "storyboard",
+            }
+        )
+        assert (caps["provider_id"], caps["model"]) == ("kling", "kling-v3")
+
+    @pytest.mark.integration
+    async def test_r2v_bucket_shadows_project_default(self):
+        """参考生视频项目读 r2v 桶，遮蔽项目默认层。"""
+        caps = await self._caps(
+            {
+                "video_backend": "grok/grok-imagine-video",
+                "video_provider_r2v": "minimax/S2V-01",
+                "generation_mode": "reference_video",
+            }
+        )
+        assert (caps["provider_id"], caps["model"]) == ("minimax", "S2V-01")
+
+    @pytest.mark.integration
+    async def test_same_config_follows_generation_mode(self):
+        """同一份配置下切 generation_mode，能力查询随桶换到另一个模型。"""
+        project = {
+            "video_provider_i2v": "kling/kling-v3",
+            "video_provider_r2v": "minimax/S2V-01",
+        }
+        i2v_caps = await self._caps({**project, "generation_mode": "storyboard"})
+        r2v_caps = await self._caps({**project, "generation_mode": "reference_video"})
+        assert i2v_caps["model"] == "kling-v3"
+        assert r2v_caps["model"] == "S2V-01"
+        # 能力字典本身随之变：i2v 桶的型号不接受参考图
+        assert i2v_caps["max_reference_images"] == 0
+        assert r2v_caps["max_reference_images"] == 1
+
+    @pytest.mark.integration
+    async def test_reference_video_project_errors_when_model_lacks_reference_support(self):
+        """参考生视频项目解析到无参考图能力的模型时报结构化错误，不静默换模型。"""
+        with pytest.raises(VideoBucketCapabilityError) as excinfo:
+            await self._caps({"video_backend": "kling/kling-v3", "generation_mode": "reference_video"})
+        assert excinfo.value.code == "video_capability_missing_r2v"
+        assert excinfo.value.params == {"provider": "kling", "model": "kling-v3"}
+
+    @pytest.mark.integration
+    async def test_storyboard_project_errors_when_model_lacks_first_frame(self):
+        """图生视频项目解析到无首帧能力的模型时同样报错（桶换成 i2v）。"""
+        with pytest.raises(VideoBucketCapabilityError) as excinfo:
+            await self._caps({"video_backend": "minimax/S2V-01", "generation_mode": "storyboard"})
+        assert excinfo.value.code == "video_capability_missing_i2v"
+
+    @pytest.mark.integration
+    async def test_duration_constraints_evaluate_on_bucket_model(self):
+        """时长收窄按桶生效模型求值：参考生视频项目落 r2v 桶模型声明的「参考图↔时长」约束。"""
+        project = {
+            "video_provider_i2v": "kling/kling-v3",
+            "video_provider_r2v": "gemini-aistudio/veo-3.1-generate-preview",
+            "generation_mode": "reference_video",
+        }
+        caps = await self._caps(project)
+        assert caps["model"] == "veo-3.1-generate-preview"
+        assert caps["supported_durations"] == [4, 6, 8]
+        constrained = constrain_durations_for_project(
+            project,
+            list(caps["supported_durations"]),
+            provider_id=caps["provider_id"],
+            model_id=caps["model"],
+            generation_mode="reference_video",
+        )
+        assert constrained == [8]
+
+    @pytest.mark.integration
+    async def test_max_reference_images_follows_backend_declaration(self):
+        """viduq3-pro 不在 /reference2video 白名单：能力查询报 0，不报 registry 的并行声明。"""
+        caps = await self._caps({"video_backend": "vidu/viduq3-pro", "generation_mode": "storyboard"})
+        assert caps["max_reference_images"] == 0
+
+
 class TestVideoCapabilities:
     """验证 video_capabilities：第一步模型选择 + 第二步 model 能力查询。"""
 
@@ -469,7 +572,7 @@ class TestVideoCapabilities:
         assert caps["source"] == "registry"
         assert caps["supported_durations"] == [4, 6, 8]
         assert caps["max_duration"] == 8
-        # max_reference_images 来源：registry 中该 veo 视频模型的 ModelInfo.max_reference_images
+        # max_reference_images 来源：backend 的 VideoCapabilities 声明（与执行层同源）
         assert caps["max_reference_images"] == 3
 
     async def test_reads_project_default_duration_and_modes(self):
@@ -508,6 +611,7 @@ class TestVideoCapabilities:
         assert caps["default_duration"] is None
 
     async def test_unknown_model_raises(self):
+        """悬空模型引用在能力桶解析闸即报错，携带可本地化的 code。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={})
         factory, engine = await _make_session()
@@ -517,10 +621,12 @@ class TestVideoCapabilities:
                     mock_pm.return_value.load_project.return_value = {
                         "video_backend": "grok/nonexistent-model",
                     }
-                    with pytest.raises(ValueError, match="model not found"):
+                    with pytest.raises(VideoBucketCapabilityError) as excinfo:
                         await resolver._resolve_video_capabilities(fake_svc, session, "demo")
         finally:
             await engine.dispose()
+        assert excinfo.value.code == "video_capability_reference_unavailable"
+        assert excinfo.value.capability == "i2v"
 
     async def test_unknown_provider_raises(self):
         resolver = ConfigResolver.__new__(ConfigResolver)
@@ -532,7 +638,7 @@ class TestVideoCapabilities:
                     mock_pm.return_value.load_project.return_value = {
                         "video_backend": "bogus-provider/some-model",
                     }
-                    with pytest.raises(ValueError, match="provider not in PROVIDER_REGISTRY"):
+                    with pytest.raises(VideoBucketCapabilityError):
                         await resolver._resolve_video_capabilities(fake_svc, session, "demo")
         finally:
             await engine.dispose()
@@ -572,22 +678,25 @@ class TestVideoCapabilities:
             await engine.dispose()
         assert caps["max_reference_images"] == 1
 
-    async def test_max_reference_images_reads_model_info_for_minimax_s2v(self):
-        """minimax S2V-01 的 max_reference_images 来自 registry ModelInfo（=1）；
+    async def test_max_reference_images_reads_backend_caps_for_minimax_s2v(self):
+        """minimax S2V-01 的 max_reference_images 来自 backend 声明（=1）；
 
-        编排层据此只取 1 张参考图，不会向只吃单脸的 S2V-01 拼多张。
+        编排层据此只取 1 张参考图，不会向只吃单脸的 S2V-01 拼多张。S2V-01 不支持首帧，
+        项目须是参考生视频模式才落进它所属的 r2v 桶。
         """
         factory, engine = await _make_session()
         try:
             resolver = ConfigResolver(factory)
             with patch("lib.config.resolver.get_project_manager"):
-                caps = await resolver.video_capabilities_for_project({"video_backend": "minimax/S2V-01"})
+                caps = await resolver.video_capabilities_for_project(
+                    {"video_backend": "minimax/S2V-01", "generation_mode": "reference_video"}
+                )
         finally:
             await engine.dispose()
         assert caps["max_reference_images"] == 1
 
-    async def test_max_reference_images_reads_model_info_for_ark_seedance(self):
-        """ark seedance 的 max_reference_images 来自 registry ModelInfo（=9）。"""
+    async def test_max_reference_images_reads_backend_caps_for_ark_seedance(self):
+        """ark seedance 的 max_reference_images 来自 backend 声明（=9）。"""
         factory, engine = await _make_session()
         try:
             resolver = ConfigResolver(factory)
@@ -599,10 +708,10 @@ class TestVideoCapabilities:
             await engine.dispose()
         assert caps["max_reference_images"] == 9
 
-    async def test_max_reference_images_reads_model_info_for_kling_v3_omni(self):
-        """kling-v3-omni（多图主体 R2V）的 max_reference_images 来自 registry ModelInfo（=4，保守值）；
+    async def test_max_reference_images_reads_backend_caps_for_kling_v3_omni(self):
+        """kling-v3-omni（多图主体 R2V）的 max_reference_images 来自 backend 声明（=4，保守值）；
 
-        编排层据此裁剪参考图数量——内置 provider 经此值而非 backend caps 拿到上限。
+        编排层据此裁剪参考图数量，与执行期 gate_video_request 依据的是同一个数。
         """
         factory, engine = await _make_session()
         try:
@@ -613,8 +722,8 @@ class TestVideoCapabilities:
             await engine.dispose()
         assert caps["max_reference_images"] == 4
 
-    async def test_max_reference_images_reads_model_info_for_kling_video_o1(self):
-        """kling-video-o1（多图主体 R2V）的 max_reference_images 来自 registry ModelInfo（=4，保守值）。"""
+    async def test_max_reference_images_reads_backend_caps_for_kling_video_o1(self):
+        """kling-video-o1（多图主体 R2V）的 max_reference_images 来自 backend 声明（=4，保守值）。"""
         factory, engine = await _make_session()
         try:
             resolver = ConfigResolver(factory)
@@ -715,9 +824,11 @@ class TestVideoCapabilities:
         assert caps["max_reference_images"] == 1
 
     @pytest.mark.integration
-    async def test_custom_disabled_model_falls_back_to_default_like_execution_layer(self):
-        """project 仍指向已禁用的 model 时，能力解析须与 loader.load_custom_backend 同一条回退
-        规则改读默认启用 model——否则会宣称执行层实际不会兑现的 first_frame/last_frame。"""
+    async def test_custom_disabled_model_errors_like_execution_layer(self):
+        """project 仍指向已禁用的 model 时，能力解析与执行路径同样在能力桶解析闸报悬空引用。
+
+        不静默换成该供应商的默认启用 model（``docs/adr/0054``）：宣称一个用户没选过的模型的能力，
+        与执行期直接报错的行为对不上。"""
         from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
 
         resolver = ConfigResolver.__new__(ConfigResolver)
@@ -759,13 +870,11 @@ class TestVideoCapabilities:
                     mock_pm.return_value.load_project.return_value = {
                         "video_backend": project_backend,
                     }
-                    caps = await resolver._resolve_video_capabilities(fake_svc, session, "demo")
+                    with pytest.raises(VideoBucketCapabilityError) as excinfo:
+                        await resolver._resolve_video_capabilities(fake_svc, session, "demo")
         finally:
             await engine.dispose()
-        assert caps["model"] == "default-model"
-        assert caps["supported_durations"] == [5, 10]
-        # newapi-video 不接受尾帧覆盖；已禁用 model 的 last_frame=True 覆盖不应残留
-        assert caps["last_frame"] is False
+        assert excinfo.value.code == "video_capability_reference_unavailable"
 
 
 @pytest.mark.integration
@@ -904,7 +1013,13 @@ class TestVoiceConsistency:
                     display_name="Seedance-like",
                     endpoint="ark-seedance",
                     supported_durations="[4, 8]",
-                    capability_overrides={"reference_audio_mode": "direct", "max_reference_audio_count": 2},
+                    # max_reference_images 覆盖是让该 model 落进 r2v 桶的前提：参考生视频项目按
+                    # r2v 定桶解析，ark-seedance 对未上表型号保守判 0，不覆盖会被解析闸挡在能力查询前
+                    capability_overrides={
+                        "reference_audio_mode": "direct",
+                        "max_reference_audio_count": 2,
+                        "max_reference_images": 4,
+                    },
                 )
                 session.add(model)
                 await session.flush()
@@ -978,7 +1093,7 @@ class TestVideoPricingGenerateAudio:
 
 
 class TestResolveImageBackend:
-    """resolve_image_backend：payload > project > 全局默认，capability=t2i/i2i 各覆盖。"""
+    """resolve_image_backend：payload > 项目桶 > 项目默认 > 全局桶 > 全局默认 > 自动推断。"""
 
     async def test_payload_capability_slot_wins(self):
         resolver = ConfigResolver.__new__(ConfigResolver)
@@ -1006,8 +1121,50 @@ class TestResolveImageBackend:
         assert (t2i.provider_id, t2i.model_id) == ("ark", "proj-t2i")
         assert (i2i.provider_id, i2i.model_id) == ("ark", "proj-i2i")
 
+    @pytest.mark.unit
+    async def test_project_bucket_wins_over_project_default(self):
+        """项目桶优先于项目默认（default_image_backend）。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={})
+        project = {"image_provider_t2i": "ark/proj-t2i", "default_image_backend": "openai/proj-default"}
+        resolved = await resolver._resolve_image_provider_model(fake_svc, None, project, {}, "t2i")
+        assert (resolved.provider_id, resolved.model_id) == ("ark", "proj-t2i")
+
+    @pytest.mark.unit
+    async def test_project_default_wins_over_global_layers(self):
+        """项目桶未配时落项目默认，遮蔽全局桶与全局默认。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(
+            settings={
+                "default_image_backend_t2i": "grok/global-t2i",
+                "default_image_backend": "grok/global-default",
+            }
+        )
+        project = {"default_image_backend": "openai/proj-default"}
+        for capability in ("t2i", "i2i"):
+            resolved = await resolver._resolve_image_provider_model(fake_svc, None, project, {}, capability)
+            assert (resolved.provider_id, resolved.model_id) == ("openai", "proj-default")
+
+    @pytest.mark.unit
+    async def test_empty_project_bucket_falls_through_to_project_default(self):
+        """项目桶为空字符串 → 回退项目默认，不跳过默认层。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={})
+        project = {"image_provider_i2i": "", "default_image_backend": "openai/proj-default"}
+        resolved = await resolver._resolve_image_provider_model(fake_svc, None, project, {}, "i2i")
+        assert (resolved.provider_id, resolved.model_id) == ("openai", "proj-default")
+
+    @pytest.mark.unit
+    async def test_only_global_default_covers_both_capabilities(self):
+        """只配全局默认层、两桶皆空 → t2i / i2i 都解析到该模型。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_image_backend": "grok/grok-2-image"})
+        for capability in ("t2i", "i2i"):
+            resolved = await resolver._resolve_image_provider_model(fake_svc, None, None, None, capability)
+            assert (resolved.provider_id, resolved.model_id) == ("grok", "grok-2-image")
+
     async def test_falls_through_to_global_default(self):
-        """payload/project 都缺 → 落到全局默认（显式 default_image_backend_t2i）。"""
+        """payload/project 都缺 → 落到全局桶（显式 default_image_backend_t2i）。"""
         resolver = ConfigResolver.__new__(ConfigResolver)
         fake_svc = _FakeConfigService(settings={"default_image_backend_t2i": "grok/grok-2-image"})
         resolved = await resolver._resolve_image_provider_model(fake_svc, None, None, None, "t2i")
@@ -1062,6 +1219,85 @@ class TestResolveImageBackend:
         payload = {"image_provider": "openai"}  # 只有 provider，无 image_model
         resolved = await resolver._resolve_image_provider_model(fake_svc, None, {}, payload, "t2i")
         assert (resolved.provider_id, resolved.model_id) == ("openai", "gpt-image-2")
+
+
+@pytest.mark.unit
+class TestLayeredBackendSkeleton:
+    """「默认 + 能力桶」四级解析骨架：项目桶 > 项目默认 > 全局桶 > 全局默认 > 自动推断。
+
+    用带全部四层键位的合成声明直测骨架契约，与各媒体的具体键位无关；媒体桶接入只补
+    键位声明、不改骨架本身。
+    """
+
+    @staticmethod
+    def _keys(**overrides):
+        from lib.config.resolver import _LayeredBackendKeys
+
+        params = {
+            "media_type": "image",
+            "parse_fallback": "fallback/m",
+            "project_bucket_key": "img_bucket",
+            "project_default_key": "img_default",
+            "global_bucket_key": "global_bucket",
+            "global_default_key": "global_default",
+        }
+        params.update(overrides)
+        return _LayeredBackendKeys(**params)
+
+    @pytest.mark.parametrize("p_bucket", [False, True])
+    @pytest.mark.parametrize("p_def", [False, True])
+    @pytest.mark.parametrize("g_bucket", [False, True])
+    @pytest.mark.parametrize("g_def", [False, True])
+    async def test_four_level_priority_all_combinations(self, p_bucket, p_def, g_bucket, g_def):
+        settings = {}
+        if g_bucket:
+            settings["global_bucket"] = "g-bucket/m"
+        if g_def:
+            settings["global_default"] = "g-def/m"
+        project = {}
+        if p_bucket:
+            project["img_bucket"] = "p-bucket/m"
+        if p_def:
+            project["img_default"] = "p-def/m"
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings=settings)
+        result = await resolver._resolve_layered_backend(fake_svc, None, project, self._keys())
+
+        if p_bucket:
+            assert result == ("p-bucket", "m")
+        elif p_def:
+            assert result == ("p-def", "m")
+        elif g_bucket:
+            assert result == ("g-bucket", "m")
+        elif g_def:
+            assert result == ("g-def", "m")
+        else:
+            assert result[0] == "gemini-aistudio"  # 全层缺失 → 自动推断到 ready provider
+
+    async def test_none_keys_skip_that_level(self):
+        """键位为 None 的层直接跳过——项目默认层未声明时项目里的同名字段不生效。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"global_default": "g-def/m"})
+        project = {"img_default": "p-def/m"}
+        keys = self._keys(project_bucket_key=None, project_default_key=None)
+        result = await resolver._resolve_layered_backend(fake_svc, None, project, keys)
+        assert result == ("g-def", "m")
+
+    @pytest.mark.unit
+    async def test_empty_global_bucket_follows_default(self):
+        """全局桶键存在但无有效值 → 回退全局默认层（docs/adr/0054）。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"global_bucket": "", "global_default": "g-def/m"})
+        result = await resolver._resolve_layered_backend(fake_svc, None, None, self._keys())
+        assert result == ("g-def", "m")
+
+    async def test_project_bare_provider_supported(self):
+        """项目层兼容裸 provider 覆盖（补该 provider 默认 model），与既有图片/视频项目字段语义一致。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"global_default": "g-def/m"})
+        result = await resolver._resolve_layered_backend(fake_svc, None, {"img_bucket": "openai"}, self._keys())
+        assert result == ("openai", "gpt-image-2")
 
 
 class TestResolveVideoBackend:
@@ -1160,6 +1396,217 @@ class TestResolveVideoBackend:
         resolved = await resolver._resolve_video_provider_model(fake_svc, None, {}, payload)
         assert resolved.provider_id == "ark"
         assert resolved.model_id == "doubao-seedance-2-0-mini-260615"  # 补 ark 默认 video model
+
+
+@pytest.mark.unit
+class TestResolveVideoBackendBuckets:
+    """capability 给定时的视频四级解析（项目桶 > 项目默认 > 全局桶 > 全局默认 > 自动推断）与能力闸。
+
+    能力闸样本取 backend 声明的真实能力位：vidu/viduq3-pro 仅 i2v、dashscope/happyhorse-1.0-r2v
+    仅 r2v、ark 全系两桶齐备（见 lib/capability_buckets.py 的判定口径）。
+    """
+
+    async def test_project_bucket_wins_over_project_default(self):
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={})
+        project = {"video_provider_i2v": "vidu/viduq3-pro", "video_backend": "grok/grok-imagine-video"}
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, project, None, "i2v")
+        assert (resolved.provider_id, resolved.model_id) == ("vidu", "viduq3-pro")
+
+    async def test_project_default_wins_over_global_bucket(self):
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_video_backend_i2v": "grok/grok-imagine-video"})
+        project = {"video_backend": "ark/doubao-seedance-2-0-mini-260615"}
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, project, None, "i2v")
+        assert (resolved.provider_id, resolved.model_id) == ("ark", "doubao-seedance-2-0-mini-260615")
+
+    async def test_global_bucket_wins_over_global_default(self):
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(
+            settings={
+                "default_video_backend_r2v": "minimax/S2V-01",
+                "default_video_backend": "grok/grok-imagine-video",
+            }
+        )
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, None, None, "r2v")
+        assert (resolved.provider_id, resolved.model_id) == ("minimax", "S2V-01")
+
+    async def test_empty_global_bucket_falls_back_to_global_default(self):
+        """视频空桶语义（docs/adr/0054）：桶键存在但为空 → 回退全局默认层，不直达自动推断。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(
+            settings={
+                "default_video_backend_r2v": "",
+                "default_video_backend": "grok/grok-imagine-video",
+            }
+        )
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, None, None, "r2v")
+        assert (resolved.provider_id, resolved.model_id) == ("grok", "grok-imagine-video")
+
+    async def test_auto_resolve_when_nothing_configured(self):
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={})
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, None, None, "i2v")
+        assert resolved.provider_id == "gemini-aistudio"
+
+    async def test_payload_wins_and_skips_capability_gate(self):
+        """已入队任务按 payload 照常执行：payload 命中不过能力闸，r2v 桶下仍放行仅 i2v 的模型。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={})
+        payload = {"video_provider": "vidu", "video_model": "viduq3-pro"}
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, None, payload, "r2v")
+        assert (resolved.provider_id, resolved.model_id) == ("vidu", "viduq3-pro")
+
+    async def test_missing_i2v_capability_raises_structured_error(self):
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_video_backend": "dashscope/happyhorse-1.0-r2v"})
+        with pytest.raises(VideoBucketCapabilityError) as exc_info:
+            await resolver._resolve_video_provider_model(fake_svc, None, None, None, "i2v")
+        exc = exc_info.value
+        assert exc.code == "video_capability_missing_i2v"
+        assert exc.capability == "i2v"
+        assert exc.params == {"provider": "dashscope", "model": "happyhorse-1.0-r2v"}
+
+    async def test_missing_r2v_capability_raises_structured_error(self):
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_video_backend": "minimax/MiniMax-Hailuo-2.3"})
+        with pytest.raises(VideoBucketCapabilityError) as exc_info:
+            await resolver._resolve_video_provider_model(fake_svc, None, None, None, "r2v")
+        assert exc_info.value.code == "video_capability_missing_r2v"
+
+    async def test_bucket_reference_to_unknown_model_raises_unavailable(self):
+        """悬空引用（注册表已无该 model）由同一解析闸报错兜底，不静默换模型。"""
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(settings={"default_video_backend_i2v": "ark/removed-model"})
+        with pytest.raises(VideoBucketCapabilityError) as exc_info:
+            await resolver._resolve_video_provider_model(fake_svc, None, None, None, "i2v")
+        assert exc_info.value.code == "video_capability_reference_unavailable"
+        assert exc_info.value.params == {"provider": "ark", "model": "removed-model"}
+
+    async def test_bucket_reference_to_non_video_model_raises_unavailable(self):
+        """所引模型不是视频模型同属悬空引用：backend caps 函数对同 provider 的图片模型也返回
+        静态能力（``gemini-aistudio/gemini-3.1-flash-image-preview`` 会拿到 first_frame=True），
+        只判成员资格会放行，落到执行层才炸。"""
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(
+            settings={"default_video_backend_i2v": "gemini-aistudio/gemini-3.1-flash-image-preview"}
+        )
+        with pytest.raises(VideoBucketCapabilityError) as exc_info:
+            await resolver._resolve_video_provider_model(fake_svc, None, None, None, "i2v")
+        assert exc_info.value.code == "video_capability_reference_unavailable"
+
+    async def test_capability_none_keeps_legacy_resolution_without_gate(self):
+        """不定桶调用（费用估算、限流路由兜底）保持旧三级解析，不读桶键、不过能力闸。"""
+        resolver = ConfigResolver.__new__(ConfigResolver)
+        fake_svc = _FakeConfigService(
+            settings={
+                "default_video_backend_i2v": "ark/doubao-seedance-2-0-mini-260615",
+                "default_video_backend": "dashscope/happyhorse-1.0-r2v",
+            }
+        )
+        resolved = await resolver._resolve_video_provider_model(fake_svc, None, None, None, None)
+        assert (resolved.provider_id, resolved.model_id) == ("dashscope", "happyhorse-1.0-r2v")
+
+
+@pytest.mark.integration
+class TestVideoBucketCapabilityGateCustomProvider:
+    """自定义供应商的能力闸：悬空引用报错而非收敛到默认模型；有效模型正常放行。"""
+
+    async def _seed_provider(self, factory, *, models):
+        from lib.db.models.custom_provider import CustomProvider, CustomProviderModel
+
+        async with factory() as session:
+            provider = CustomProvider(
+                display_name="Custom Video",
+                discovery_format="openai",
+                base_url="https://example.com",
+                api_key="xxx",
+            )
+            session.add(provider)
+            await session.flush()
+            for m in models:
+                session.add(CustomProviderModel(provider_id=provider.id, **m))
+            await session.commit()
+            return provider.id
+
+    async def test_bucket_reference_to_missing_custom_model_raises(self):
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        factory, engine = await _make_session()
+        try:
+            provider_id = await self._seed_provider(factory, models=[])
+            resolver = ConfigResolver(factory)
+            with pytest.raises(VideoBucketCapabilityError) as exc_info:
+                await resolver.resolve_video_backend(
+                    {"video_provider_r2v": f"custom-{provider_id}/ghost-model"}, None, capability="r2v"
+                )
+        finally:
+            await engine.dispose()
+        assert exc_info.value.code == "video_capability_reference_unavailable"
+
+    async def test_disabled_custom_model_raises_instead_of_converging(self):
+        """桶解析路径不做有效身份收敛：禁用模型直接报悬空，而非静默换成该供应商默认模型。"""
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        factory, engine = await _make_session()
+        try:
+            provider_id = await self._seed_provider(
+                factory,
+                models=[
+                    {
+                        "model_id": "disabled-model",
+                        "display_name": "Disabled",
+                        "endpoint": "openai-video",
+                        "is_enabled": False,
+                    },
+                    {
+                        "model_id": "runtime-model",
+                        "display_name": "Runtime",
+                        "endpoint": "openai-video",
+                        "is_enabled": True,
+                        "is_default": True,
+                    },
+                ],
+            )
+            resolver = ConfigResolver(factory)
+            with pytest.raises(VideoBucketCapabilityError) as exc_info:
+                await resolver.resolve_video_backend(
+                    {"video_backend": f"custom-{provider_id}/disabled-model"}, None, capability="i2v"
+                )
+        finally:
+            await engine.dispose()
+        assert exc_info.value.code == "video_capability_reference_unavailable"
+
+    async def test_enabled_custom_video_model_passes_gate(self):
+        factory, engine = await _make_session()
+        try:
+            provider_id = await self._seed_provider(
+                factory,
+                models=[
+                    {
+                        "model_id": "live-model",
+                        "display_name": "Live",
+                        "endpoint": "openai-video",
+                        "is_enabled": True,
+                        "is_default": True,
+                    }
+                ],
+            )
+            resolver = ConfigResolver(factory)
+            resolved = await resolver.resolve_video_backend(
+                {"video_provider_i2v": f"custom-{provider_id}/live-model"}, None, capability="i2v"
+            )
+        finally:
+            await engine.dispose()
+        assert (resolved.provider_id, resolved.model_id) == (f"custom-{provider_id}", "live-model")
 
 
 def test_parse_int_variants():
@@ -1388,3 +1835,137 @@ class TestStyleAnalysisVisionGuard:
         )
         result = await resolver._resolve_text_backend(fake_svc, MagicMock(), TextTaskType.SCRIPT, None)
         assert result == ("gemini-aistudio", "gemini-3.1-flash-lite-preview")
+
+
+class TestEpisodeEffectiveGenerationMode:
+    """能力解析按剧集生效 generation_mode 收敛：生成模式可被单集覆盖，能力须跟着该集走。"""
+
+    async def _caps(self, project: dict, episode: int | None) -> dict:
+        factory, engine = await _make_session()
+        try:
+            with patch("lib.config.resolver.get_project_manager"):
+                return await ConfigResolver(factory).video_capabilities_for_project(project, episode)
+        finally:
+            await engine.dispose()
+
+    @pytest.mark.unit
+    def test_caps_generation_mode_prefers_episode_override(self):
+        project = {
+            "generation_mode": "storyboard",
+            "episodes": [{"episode": 1}, {"episode": 2, "generation_mode": "reference_video"}],
+        }
+        assert caps_generation_mode(project, 2) == "reference_video"
+        # 未覆盖的集、无集号上下文、以及集号不存在时都回落项目级
+        assert caps_generation_mode(project, 1) == "storyboard"
+        assert caps_generation_mode(project, None) == "storyboard"
+        assert caps_generation_mode(project, 99) == "storyboard"
+
+    @pytest.mark.unit
+    def test_caps_generation_mode_none_when_nothing_declared(self):
+        """两级都未声明时为 None（未声明 ≠ 显式选了 storyboard），与无项目上下文同口径。"""
+        assert caps_generation_mode({"episodes": [{"episode": 1}]}, 1) is None
+        assert caps_generation_mode({}, None) is None
+        assert caps_generation_mode(None, 1) is None
+
+    @pytest.mark.unit
+    def test_caps_generation_mode_normalizes_out_of_table_values(self):
+        """表外脏字符串归一到默认档，不原样外泄给前端与智能体。
+
+        归一后与定桶口径一致（``video_bucket_for_generation_mode`` 对表外值同样落默认桶），
+        载荷里因此不会出现一个「模式说 bogus、能力按 storyboard 算」的自相矛盾快照。
+        """
+        assert caps_generation_mode({"generation_mode": "bogus"}, None) == "storyboard"
+        assert (
+            caps_generation_mode(
+                {"episodes": [{"episode": 1, "generation_mode": "bogus"}]},
+                1,
+            )
+            == "storyboard"
+        )
+        # 集级脏值不吃掉项目级的有效声明
+        assert (
+            caps_generation_mode(
+                {
+                    "generation_mode": "reference_video",
+                    "episodes": [{"episode": 1, "generation_mode": "bogus"}],
+                },
+                1,
+            )
+            == "reference_video"
+        )
+
+    @pytest.mark.integration
+    async def test_bucket_follows_episode_override(self):
+        """项目级分镜、某集覆盖为参考生视频：定桶随该集换到 r2v 桶的模型。"""
+        project = {
+            "generation_mode": "storyboard",
+            "video_provider_i2v": "kling/kling-v3",
+            "video_provider_r2v": "minimax/S2V-01",
+            "episodes": [{"episode": 1}, {"episode": 2, "generation_mode": "reference_video"}],
+        }
+        assert (await self._caps(project, 1))["model"] == "kling-v3"
+        assert (await self._caps(project, 2))["model"] == "S2V-01"
+
+    @pytest.mark.integration
+    async def test_voice_consistency_follows_episode_override(self):
+        """覆盖集的声音一致性按该集解析为 native——按项目级会降格 soft，该集将永远不发参考音频。"""
+        project = {
+            "generation_mode": "storyboard",
+            "video_provider_r2v": "ark/doubao-seedance-2-0-260128",
+            "video_backend": "ark/doubao-seedance-2-0-260128",
+            "episodes": [{"episode": 1}, {"episode": 2, "generation_mode": "reference_video"}],
+        }
+        assert (await self._caps(project, 2))["voice_consistency"] == "native"
+        assert (await self._caps(project, 2))["generation_mode"] == "reference_video"
+        # 未覆盖的集与不带集号的查询保持项目级口径
+        assert (await self._caps(project, 1))["voice_consistency"] == "soft"
+        assert (await self._caps(project, None))["voice_consistency"] == "soft"
+
+    @pytest.mark.integration
+    async def test_uses_reference_images_constraint_follows_episode_override(self):
+        """caps 的 generation_mode 是下游时长约束的入参，覆盖集据此施加「参考图↔时长」约束。"""
+        project = {
+            "generation_mode": "storyboard",
+            "video_provider_r2v": "minimax/S2V-01",
+            "episodes": [{"episode": 2, "generation_mode": "reference_video"}],
+        }
+        caps = await self._caps(project, 2)
+        assert caps["generation_mode"] == "reference_video"
+        assert caps["max_reference_images"] == 1
+
+
+class TestResolveRawSupportedDurations:
+    """收窄前的时长全集：caps → registry 两级解析。"""
+
+    _VEO_PROJECT = {"video_backend": "gemini-aistudio/veo-3.1-generate-preview"}
+
+    @pytest.mark.unit
+    def test_caps_take_precedence_over_registry(self):
+        """caps 是 DB 驱动的当下真相，压过 project.json 自报身份查到的静态声明。"""
+        caps = {"supported_durations": [5, 10]}
+        assert resolve_raw_supported_durations(dict(self._VEO_PROJECT), caps) == [5, 10]
+
+    @pytest.mark.unit
+    def test_falls_back_to_registry_identity_without_caps(self):
+        assert resolve_raw_supported_durations(dict(self._VEO_PROJECT)) == [4, 6, 8]
+
+    @pytest.mark.unit
+    def test_custom_provider_resolves_only_through_caps(self):
+        """``custom-`` 前缀不在 registry：不带 caps 时无从解析，带 caps 时取 caps 的档位表。
+
+        这条是审阅门必须先解析 caps 的原因——同步两级链对自定义供应商恒为 None。
+        """
+        project = {"video_backend": "custom-7/acme-video"}
+        assert resolve_raw_supported_durations(project) is None
+        assert resolve_raw_supported_durations(project, {"supported_durations": [5, 10]}) == [5, 10]
+
+    @pytest.mark.unit
+    def test_project_json_duration_field_is_not_a_source(self):
+        """project.json 不是档位来源：无生产写入者的字段不得再被当作一级回退读取，
+        否则伪造 / 陈旧的项目字段会盖过 registry 的真实声明。"""
+        project = dict(self._VEO_PROJECT) | {"_supported_durations": [99]}
+        assert resolve_raw_supported_durations(project) == [4, 6, 8]
+
+    @pytest.mark.unit
+    def test_none_when_no_resolvable_model(self):
+        assert resolve_raw_supported_durations({}) is None

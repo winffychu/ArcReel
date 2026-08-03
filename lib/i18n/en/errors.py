@@ -99,7 +99,13 @@ MESSAGES = {
     "draft_invalid_json": "Step 1 draft must be a valid JSON object with a non-empty scenes array, where each scene is an object with a non-empty scene_id",
     "script_review_not_applicable": "Step 1 review does not apply to this episode (this mode has no structured Step 1 intermediate)",
     "script_review_no_step1": "No Step 1 structured draft to confirm yet; please finish preprocessing first",
+    "script_review_quarantined": (
+        "This episode has a rejected Step 1 draft awaiting repair; let the agent fix and promote it before confirming"
+    ),
     "script_review_invalid_content": "Step 1 draft structure validation failed: {details}",
+    "script_review_quarantine_unreadable": (
+        "The quarantined draft file is corrupted or malformed and can't be read; ask the agent to re-split this episode"
+    ),
     "draft_event_label": "Episode {episode} {label_prefix}",
     "normalized_script": "Normalized Script",
     "segment_splitting": "Segment Splitting",
@@ -249,6 +255,10 @@ MESSAGES = {
     "ref_warn_speaker_without_audio": (
         "Character '{name}' has no reference audio: the model decides the dialogue voice"
     ),
+    "ref_warn_speaker_audio_unavailable": (
+        "Character '{name}' has reference audio set, but it is currently unavailable: "
+        "the model decides the dialogue voice"
+    ),
     "ref_warn_reference_audio_overflow": (
         "At most {limit} reference audio clips: the model decides the dialogue voice for character '{name}'"
     ),
@@ -282,6 +292,9 @@ MESSAGES = {
     "video_duration_invalid": "Video duration {duration} is not a valid integer number of seconds",
     "video_duration_not_supported": "Video duration {duration}s is not within the durations supported by this model ({supported})",
     "video_capability_missing_t2v": "{provider}/{model} does not support text-to-video; provide a first-frame image or switch to a model that supports text-to-video",
+    "video_capability_missing_i2v": "{provider}/{model} does not support image-to-video generation; assign a model that supports it for image-to-video in Settings, or change the default video model",
+    "video_capability_missing_r2v": "{provider}/{model} does not support reference-to-video generation; assign a model that supports it for reference-to-video in Settings, or change the default video model",
+    "video_capability_reference_unavailable": "The configured video model {provider}/{model} is no longer available (model deleted, capabilities changed, or provider removed); re-select a video model in Settings",
     "video_resolution_duration_unsupported": "Model {model} does not support {duration}s at {resolution} resolution (only {supported}); adjust the resolution or duration",
     "video_reference_images_duration_unsupported": "Model {model} does not support {duration}s with reference images (only {supported}); change the duration to {supported} or remove the reference images",
     "video_reference_images_required": "Model {model} requires at least one reference image; please provide reference images",
@@ -296,6 +309,7 @@ MESSAGES = {
     "video_last_frame_unsupported": "{provider}/{model} does not support a last frame under the current configuration; generation aborted. Remove the shot's last frame, or switch to a model or tier that supports it",
     "video_reference_audio_unsupported": "{provider}/{model} does not support reference audio; generation aborted. Remove the character's reference audio, or switch to a model that supports voice reference",
     "video_reference_audio_exceeded": "Model {model} supports at most {limit} reference audio clips but received {count}; reduce the number of characters with reference audio",
+    "video_reference_audio_duration_exceeded": "Model {model} supports at most {limit:g} seconds of combined reference audio but received {total:.1f} seconds; use fewer reference audio clips or shorter clips",
     "video_reference_audio_slots_insufficient": "Model {model} attaches each reference audio clip to a reference asset, but only {slots} reference assets are available for {count} clips; add reference images for those characters, or reduce the number of characters with reference audio",
     "video_reference_audio_unreadable": "Model {model} has reference audio that is missing or unreadable; generation aborted: {names}; check the reference audio paths",
     "video_reference_audio_format_unsupported": "Reference audio {name} has an unsupported format (only {supported}); use a different audio file",

@@ -8,6 +8,7 @@ from lib.i18n import _ as i18n_message
 from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import generate
+from tests.auth_deps import AUTH_DEPENDENCIES
 
 
 class _FakeQueue:
@@ -114,15 +115,22 @@ def _prepare_files(tmp_path: Path) -> Path:
     return project_path
 
 
+async def _noop_bucket_precheck(project, capability):
+    return None
+
+
 def _client(monkeypatch, fake_pm, fake_queue):
     monkeypatch.setattr(generate, "get_project_manager", lambda: fake_pm)
     monkeypatch.setattr("lib.generation_queue.get_generation_queue", lambda: fake_queue)
     monkeypatch.setattr(generate, "get_generation_queue", lambda: fake_queue)
+    # 视频桶预检需要 DB（system_settings）；router 单测无 DB，能力闸行为由
+    # test_config_resolver / test_validators_video_bucket 覆盖，这里只保 happy path 放行
+    monkeypatch.setattr(generate, "require_video_bucket_capability", _noop_bucket_precheck)
 
     app = FastAPI()
     register_error_handlers(app)
     app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
-    app.include_router(generate.router, prefix="/api/v1")
+    app.include_router(generate.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
     # raise_server_exceptions=False：500 由 app 级 Exception handler 生成响应后
     # Starlette 会 re-raise，默认配置会把它抛进测试而非返回响应
     return TestClient(app, raise_server_exceptions=False)
@@ -189,6 +197,33 @@ class TestGenerateRouter:
             assert call["task_type"] == "video"
             assert call["media_type"] == "video"
             assert call["payload"]["duration_seconds"] == 5
+
+    @pytest.mark.unit
+    def test_video_enqueue_bucket_capability_error_returns_400(self, tmp_path, monkeypatch):
+        """i2v 桶预检失败（如默认模型缺首帧能力）→ 提交入口 400 + 修复指引，不入队。"""
+        from lib.api_errors import BadRequestError
+
+        project_path = _prepare_files(tmp_path)
+        fake_pm = _FakePM(project_path)
+        fake_queue = _FakeQueue()
+        client = _client(monkeypatch, fake_pm, fake_queue)
+
+        async def _reject(project, capability):
+            assert capability == "i2v"
+            raise BadRequestError("video_capability_missing_i2v", provider="dashscope", model="happyhorse-1.0-r2v")
+
+        monkeypatch.setattr(generate, "require_video_bucket_capability", _reject)
+
+        with client:
+            res = client.post(
+                "/api/v1/projects/demo/generate/video/E1S01",
+                json={"script_file": "episode_1.json", "prompt": "x"},
+            )
+        assert res.status_code == 400
+        assert res.json()["detail"] == i18n_message(
+            "video_capability_missing_i2v", provider="dashscope", model="happyhorse-1.0-r2v"
+        )
+        assert fake_queue.calls == []
 
     def test_video_enqueue_grid_mode_uses_first_frame(self, tmp_path, monkeypatch):
         """宫格模式：storyboard 写入 _first.png 并记录于 generated_assets，路由应识别该路径。"""
@@ -575,7 +610,7 @@ class TestUnexpectedErrorMapsTo500:
         app = FastAPI()
         register_error_handlers(app)
         app.dependency_overrides[get_current_user] = lambda: CurrentUserInfo(id="default", sub="testuser", role="admin")
-        app.include_router(generate.router, prefix="/api/v1")
+        app.include_router(generate.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
         return TestClient(app, raise_server_exceptions=False)
 
     def test_storyboard_unexpected_error_maps_to_500(self, monkeypatch):

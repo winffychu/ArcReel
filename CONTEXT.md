@@ -111,8 +111,13 @@ _Avoid_: 用 `backend.name` 作 provider 查询轴；假设 `provider_model.mode
 文本生成调用点的粗粒度分级，取值 **简单** / **复杂**。每个走文本管道（TextGenerator）的调用点在代码里固定归属一档；用户配置的是「每档用哪个文本 backend」，不配置映射本身。每档一个设置项，另有一个「默认模型」作为各档未设置时的回退；解析顺序项目优先：项目档位 > 项目默认 > 全局档位 > 全局默认 > 自动推断。简单档包含需要 vision 的调用点（风格图分析），该档模型须支持图像输入。档位只管辖文本管道；Claude Agent SDK 的对话与 subagent 推理模型由 Agent 供应商配置决定，不在档位管辖内（见 `docs/adr/0051`）。
 _Avoid_: 为单个调用点开专属模型设置项（档位即配置粒度的上限）；把 Agent 对话模型当作某个档位；把「默认模型」理解为第三档——它不绑定任何任务，只是回退。
 
-**capability（t2i / i2i）**：
-图片任务的两种形态——t2i 文生图（无参考图）、i2i 图生图（带参考图）。一个镜头属于哪种，取决于"开画那一刻"是否拼出了参考图，**只有执行时才能确定**（见 `docs/adr/0001`）；入队与调度（worker claim）这两个执行前环节都无法获知。图片编辑任务是唯一例外——它必然 i2i，入队即知（见「图片编辑」）。视频任务无 capability 维度。
+**capability（t2i / i2i / i2v / r2v）**：
+媒体任务按请求形态的能力分类。图片两种：t2i 文生图（无参考图）、i2i 图生图（带参考图）——一个镜头属于哪种，取决于"开画那一刻"是否拼出了参考图，**只有执行时才能确定**（见 `docs/adr/0001`）；入队与调度（worker claim）这两个执行前环节都无法获知。图片编辑任务是唯一例外——它必然 i2i，入队即知（见「图片编辑」）。视频两种：i2v 图生视频（首帧驱动——分镜图与宫格路径）、r2v 参考生视频（参考图槽位驱动——参考生视频模式的全部镜头，**含无参考图的退化镜头**）——与图片不同，视频镜头属于哪种在执行前即知：ad 按生效 generation_mode（剧集覆盖优先于项目），narration / drama 按剧本自身的 generation_mode 戳（见 `docs/adr/0054`）。
+_Avoid_: t2v 作为 capability 维度——参考模式无图镜头归 r2v，不另立形态。
+
+**能力桶（capability bucket）**：
+按 capability 细分的**可选**模型配置槽位（图片 t2i / i2i，视频 i2v / r2v），是「默认模型」之上的细化覆盖：未配置的桶回退同层默认模型。解析顺序与文本任务档位同构、项目优先：项目桶 > 项目默认 > 全局桶 > 全局默认 > 自动推断。桶与调用点的映射固定在代码里、用户只配桶内容；桶候选按能力预过滤，解析时能力不满足直接报错，不静默换模型（见 `docs/adr/0054`）。「能力桶」是代码与文档内部术语，界面呈现用「按用途指定模型」，不直接暴露给用户。
+_Avoid_: 把桶当强制配置（默认模型才是唯一兜底层）；按 generation_mode 逐模式设桶（桶的维度是能力不是路径）；把「默认模型」理解为又一个桶——它不承诺任何能力，只是回退；在用户可见文案里写「能力桶 / capability bucket」。
 
 **图片编辑（image edit）**：
 对一张已有设计图或分镜图的指令式修改：以当前图为唯一参考图、以用户的增量修改指令为唯一 prompt，产出保持原图大体不变的新版本。编辑是对**图**的分叉而非对 prompt 的分叉——原 image_prompt 不回写；编辑后再触发重新生成仍按原 prompt 重画，编辑效果只能从版本历史找回。必然 i2i。
@@ -138,7 +143,8 @@ _Avoid_: `VALID_DURATIONS` / 全局时长白名单（已删除的硬编码 `[4,6
 
 **时长联动约束（duration_resolution_constraints / reference_image_durations）**：
 在 `supported_durations` 全集之上按上下文收窄的两个 per-model 声明：前者是 `{分辨率: 允许时长}`（如 Veo `{"1080p": [8], "4k": [8]}`），后者是走参考图路径时的允许时长（如 Veo `[8]`）。两条各自独立触发、可同时生效、取交集；与 `supported_durations` 同为 registry 单一真相源。后端唯一收窄入口是 `lib/config/resolver.constrain_durations`：剧本生成的 prompt 与动态 schema、SDK MCP 工具交给 LLM 的候选、执行期未显式指定时长时的取值，都在下传前经它收窄；前端时长选择器（项目级默认与逐镜头 pill）按同一份声明过滤候选。约束求值用的生效分辨率（`_resolution_for_constraints`）取项目已保存的档位，前后端同口径；未保存时不施加分辨率约束——普通视频路径此时省略 SDK 的 resolution 参数，供应商按自己的默认档位处理（Veo 是 720p），该档位下全集本就合法。参考视频路径例外：它执行期下发 `resolution_or_fallback`，故未保存时按 provider 兜底档位求值，与实际下发的档位保持同一集合。已保存的越界时长一律给「警告 + 引导重选」，不静默改写。backend 侧另有模块级兜底常量，只在型号未登记于 registry 时生效（中转站、自定义供应商包装、已下线型号）。
-_Avoid_: 把它当通用「条件→约束」DSL 的雏形去扩展——只表达已有官方明文的联动维度；在 backend 里另写一份与 registry 平行的约束表。
+**参考图约束逐 unit 生效，不按集一刀切**：参考路径允许 unit 不带任何引用，执行层与 backend 都只在 `reference_images` 非空时施加它，故一个 unit 的生效档位取决于它自己有没有 `@[名称]` 引用。全链路同此判据——step1 拆分把「带图 / 不带图」两套档位一并注入 prompt、schema 枚举取其并集、references 从正文机械派生后逐 unit 判归属（`sdk_tools/_context.reference_unit_duration_tiers`），step2 按**最终**产出的 references 重算（`_unit_duration_off_tier`），预检与执行按落盘 references 重算（`precheck_unit` / `effective_reference_durations`），前端下拉按选中 unit 的 references 切换候选。两套档位之间不假定包含关系：`constrain_durations` 在交集为空时回退到未收窄候选，型号声明自相矛盾时带图那套反而更宽，故并集须显式求。
+_Avoid_: 把它当通用「条件→约束」DSL 的雏形去扩展——只表达已有官方明文的联动维度；在 backend 里另写一份与 registry 平行的约束表；拿「带图」那套当整集的上界（会收掉无引用 unit 本可申请的短档）。
 
 **default_duration**：
 项目级偏好时长（int）；为 null 或缺失时是一个有语义的「auto」档——由 AI 按内容节奏在 supported_durations 内自行决定，**不是**「未设置 / 待填」。
@@ -253,16 +259,24 @@ _Avoid_: 让 ad 落入「非 narration 即 drama」的二值兜底——所有�
 参考图列表从 shot 正文的 `@mention` 机械派生（首现顺序即参考图编号），但规范台词行 `@[角色]：{台词}` 整行不计入：speaker 位只驱动音色声明与 utterance 派生，给画外说话的角色附参考图会诱导模型把他画进画面，故纯画外角色有台词而无参考图。
 _Avoid_: 把 shot 与 segment（说书片段）/ DramaScene（剧集场景）混为一谈；「scene」在参考模式下三义须分辨——场景资产（scene_sheet）、剧本分镜场景（DramaScene）、镜头（shot）；手工增删改 ad 的 reference_units——它是派生物，shots 才是内容唯一真相。
 
-**三段论渲染（剧集参考路径）**：
-书写文稿发给视频模型前的机器渲染形态，三段各有归属：第一段是参考来源声明区——`<X>@图片N` 简式主体绑定（编号即随请求发出的参考图顺序）+ 声音声明（`<X>的台词音色参考 @音频N，声音特征：…`）；第二段是书写层唯一负责的镜头分镜段（`镜头N：` + 描述行 + `<X>说 {台词}` / `画外音说 {台词}`）；第三段是风格锚定与画质/稳定/字幕/水印约束包。第一、三段由渲染期机械生成，不依赖 LLM 自觉；渲染是纯函数、结果不落盘，存量文稿无需迁移即获得新渲染。发给模型的文本不含绝对秒数（时长走请求字段）。声音注入按 `voice_consistency` 分档：`native` 才绑参考音频，`native`/`soft` 均注入 `voice_style` 声音特征，`none` 不注入声音声明但保留台词渲染（供口型与表演）。音频编号 = dialogue speaker 首现顺序、受 `max_reference_audio_count` 截断，**该顺序即 `reference_audio_files` 请求字段顺序**——这是 prompt 文本与请求字段之间唯一的绑定契约，哪个角色对应哪段音频不进请求。要求音频逐段挂在具体参考素材项上的 backend（`VideoCapabilities.reference_audio_per_image`，如 wan2.7-r2v）例外：这类 backend 额外需要 `VideoGenerationRequest.reference_audio_targets`——每段音频对应的 `reference_images` 下标，由渲染层 `audio_speaker_reference_index` 派生，纯画外角色（无参考图）不落入该字段。
-_Avoid_: 让 LLM 书写第一段或第三段——书写层只写第二段，其余机器补；把角色与音频的对应关系塞进请求字段——绑定只由第一段文本表达，请求侧只有顺序（`reference_audio_per_image` backend 的下标对齐字段除外，见上）；解析预览与生成各自重算声音绑定——两者共用 `derive_voice_bindings`，否则面板承诺的绑定与实际发出的绑定会分叉。
+**三段论渲染（参考生视频路径）**：
+narration/drama 与 ad 共用同一套渲染管线，发给视频模型前的机器渲染形态，三段各有归属：第一段是参考来源声明区——主体绑定 + 声音声明（`<X>的台词音色参考 @音频N，声音特征：…`）；第二段是镜头分镜段，台词行渲染 `<X>说 {台词}` / `画外音说 {台词}`；第三段是风格锚定与画质/稳定/字幕/水印约束包。第一、三段由渲染期机械生成，不依赖 LLM 自觉；渲染是纯函数、结果不落盘。narration/drama 的整段文本不含绝对秒数（时长走请求字段）；ad 的第二段例外——`Shot N (Xs)` 逐镜头秒数保留在文本里，剪映导出与字幕对齐依赖它，不随对齐折叠进请求字段。两条路径第一、三段实现共用（`lib/reference_video/prompt_render.py` 的 `_render_voice_declarations` / `_render_segment_three`），第二段各自成文：narration/drama 的输入是书写层自由文本（`render_unit_prompt`，书写层只写 `镜头N：` 分镜段，主体绑定 `<X>@图片N` 简式记号——编号即随请求发出的参考图顺序，经 `parse_prompt` / `@[X]` mention 解析派生），ad 的输入是结构化镜头字段（`render_ad_backend_prompt`，无书写层、不引入 mention 语法，主体记号直接取参考条目的展示 label——产品区分 sheet/原图两态、资产统一「设计图」态；`Shot N (Xs): ...` 镜头段与 per-shot duration 不动，dialogue 取 `video_prompt.dialogue` 结构化列表而非文本行解析）。声音注入按 `voice_consistency` 分档：`native` 才绑参考音频，`native`/`soft` 均注入 `voice_style` 声音特征，`none` 不注入声音声明但保留台词渲染（供口型与表演）。音频编号 = dialogue speaker 首现顺序、受 `max_reference_audio_count` 截断，**该顺序即 `reference_audio_files` 请求字段顺序**——这是 prompt 文本与请求字段之间唯一的绑定契约，哪个角色对应哪段音频不进请求。要求音频逐段挂在具体参考素材项上的 backend（`VideoCapabilities.reference_audio_per_image`，如 wan2.7-r2v）例外：这类 backend 额外需要 `VideoGenerationRequest.reference_audio_targets`——每段音频对应的 `reference_images` 下标，由渲染层 `audio_speaker_reference_index` 派生，纯画外角色（无参考图）不落入该字段。
+_Avoid_: 让 LLM 书写第一段或第三段——narration/drama 书写层只写第二段，其余机器补；给 ad 镜头字段引入 mention 语法——ad 已结构化枚举画面主体，无需从自由文本解析；把角色与音频的对应关系塞进请求字段——绑定只由第一段文本表达，请求侧只有顺序（`reference_audio_per_image` backend 的下标对齐字段除外，见上）；解析预览与生成各自重算声音绑定——两者共用 `derive_voice_bindings`，否则面板承诺的绑定与实际发出的绑定会分叉。
+
+**书写层文稿（参考生视频）**：
+参考路径上「一个 unit 的正文」的统一表达——按行书写的扁平文本，只有镜头行（`镜头N：`）、规范台词行（`@[角色]：{台词}`）、画外音行（`{台词}`）三种，资产统一写 `@[名称]`。人在编辑器里写的、step1 拆分产出的、step2 展开产出的是同一种格式，故语法只有一份真相源（`lib/reference_video/writing_syntax.py`，与解析器同域），两级 prompt 注入同一份、agent 侧文档只留概览。**LLM 只写内容，机器写结构**：unit_id 按序编号、shots 按 `镜头N：` 切分、references 与 utterances 从正文派生，都不进 LLM 输出——schema 因此退化为一层扁平（step1 `{duration, source_text, text}`、step2 `{text}`），只承担枚举与外层结构约束，文本内的语法交 parser 后校验。两级职责切分：**step1 是结构与内容契约**（unit 边界、时长即计费、台词落位、核心资产指认，用户在审阅 gate 上确认的正是这份契约），**step2 只做视觉展开**（描述行自由扩写，unit 数、unit 时长、台词规范行逐字保结构，改动任一项即整份产出被拒）。同一 parser 两套严格度：编辑器侧（人写）出 warning、照常落盘，机器产物侧一律拒——按「产物来源是否有作者意图可保护」分流；**派生本身不分流**，两侧共用同一个 references 派生入口（`shot_parser.derive_references_from_text`），否则同一份正文会在编辑器与生成侧派生出不同的 `[图N]` 编号。
+_Avoid_: 让 step2 改台词以迁就画面——台词配不上画面时的出路是回 step1 重拆；把语法规范再抄一份到 agent 文档或 prompt 里；把机器可派生的字段（unit_id / references / utterances）交给 LLM 写再去校验它写得对不对。
+
+**隔离草稿（参考生视频违约产物）**：
+机器产物违约时的处置形态——正式文件一步不动，违约产出连同逐条违约报告落到同目录的 `*.invalid.json`（step1 / step2 各一份），由在场 agent 修复后晋升，不丢弃重抽。生成一次即计费，重抽既烧钱又不收敛（同一模型对同一份输入大概率再犯同一类错）。信封是 `{kind, episode, meta, violations[], content}`：`content` 装**扁平书写层产物**（LLM 面的形状），结构字段仍由机器派生——让 agent 编辑派生物等于给漂移开口子；`violations[]` 每条带违约类（`code`）与 unit 定位（`label`），只是上一轮判定的快照，晋升时一律按 `content` 现值重判。晋升走的是产出时那套校验器本身而非它的副本，杜绝「晋升放行、下次生成被拒」的分叉；仍违约则报告刷新、草稿留在原地继续改，**无收敛轮次上限**（每轮都带着具体定位在改，不是碰运气）。隔离草稿在场期间审阅 gate 拒绝确认、step2 拒绝生成——它与「正式文件的内容指纹」是两件事：重拆分违约时正式文件原封不动，只看指纹会把该集判成已确认并放行上一版内容。schema 层（JSON 不合法 / 外层形状不符）不进此机制，仍由 backend 重试兜底——但草稿是 agent 手改的，晋升时 schema 与内容约束一并重判，改坏字段同样只回报告。正式 step1 一旦重新落盘（重拆或晋升），在场的 step2 隔离草稿随之清除：它的保结构 diff 以旧 step1 为基底，留着既晋升不了又会一直阻塞生成。声音降级的三类提示（角色未设参考音频、参考音频段数超上限、无声模型知会）不是违约：照常落盘，随产物一并呈现。
+_Avoid_: 把违约产物丢弃后重抽；让 agent 在隔离草稿里手写 unit_id / shots / references；给晋升加轮次上限或「超过 N 轮就重抽」的兜底；把隔离态与审阅 gate 的 pending 混为一条出路——前者要 agent 改草稿再晋升，后者要用户去 Web 端确认。
 
 **发声条目（utterance）**：
 drama 场景里「说出来的话」的统一单元——每条要么是角色台词（有说话人），要么是画外音 / 旁白（无说话人）。一个 `DramaScene` 持有一条**有序**发声序列（`utterances`），插入顺序即幕内先后（台词与画外音交错的先后由此表达）。类型决定下游去向：台词进视频生成、由供应商生成口型音轨；画外音不进视频，留给成片字幕与日后 TTS。drama 的口播内容以此为单一真相源；narration 的口播不走 utterances，仍是被朗读的 `novel_text`。参考生视频路径复用同一类型但不落盘：分镜文稿是唯一真相，utterances 按行读时派生（规范台词行 → 台词、裸 `{…}` 行 → 画外音、混写在描述行的花括号不派生只出提示），归属镜头级，存量文稿无台词符号时自然为空。
 _Avoid_: 把台词与画外音当两个独立无序字段（先后会丢、下游要拼两源）；把 utterance 与说书 `novel_text` 混为一谈——后者是整段被朗读的原文（基数为一）、前者是场景内逐条发声（基数为多）；把画外音塞给视频供应商音轨——供应商音轨只承载口型台词，画外音走字幕 / TTS。
 
 **场景原文锚（source_text）**：
-drama 场景级的逐字原文摘录——记录该场景所源自的原文片段，供人工审阅对照、单场景重生成与失真定位。是 best-effort 追溯锚（由 LLM 复制、可能轻微漂移），不是逐字保真的 ground truth（保真由提取流水线保证）；本身不被朗读、不出音，与作为口播的发声条目分属两事。角色上类比说书 `novel_text`，但 `novel_text` 身兼原文与被朗读的口播，`source_text` 纯作原文锚。
+drama 场景级 / 参考路径 unit 级的逐字原文摘录——记录该条目所源自的原文片段，供人工审阅对照、单条目重生成与失真定位。本身不被朗读、不出音，与作为口播的发声条目分属两事。角色上类比说书 `novel_text`，但 `novel_text` 身兼原文与被朗读的口播，`source_text` 纯作原文锚。**两条路径的严格度不同**：drama 是 best-effort（由 LLM 复制、可能轻微漂移，保真由提取流水线保证）；参考路径 step1 的锚经机械校验——空白归一后须是源文逐字子串，否则整份拆分被拒。只判子串、不判完整覆盖：unit 是画面单元不是朗读单元，原文里的转述段落可以不进任何锚（与说书 `novel_text` 的按序完整覆盖校验区分）。
 _Avoid_: 把 source_text 当会被配音 / 朗读的内容；与 episode 级 `source_range`（集对应的原文偏移区间）混为一类——一个是场景级逐字文本、一个是集级字符偏移。
 
 **源文件性质（source_kind）/ 剧本源（screenplay source）**：
@@ -357,6 +371,14 @@ _Avoid_: 把开场白生产塞进组件——缓冲回放与扫描快照无一�
 **下载 token（download token）**：
 项目导出专用的短时效（约 5 分钟）、绑定项目名的一次性 JWT（`purpose=download`），作为导出端点的 query param 唯一认证方式——端点自校验、不读 Authorization header，让浏览器原生下载的 URL 里不出现长效凭证。
 _Avoid_: 与长效会话 JWT、API Key 混为一谈；把登录 JWT 放进下载 URL。
+
+**浏览器直发请求（browser-initiated request）**：
+由浏览器自身发起、无法携带 `Authorization` header 的请求——`<img>` / `<video>` 的 src 加载、`EventSource` 订阅、原生下载导航。ArcReel 对这三处各有各的答案：SSE 用 query param 传长效会话 JWT，导出用下载 token，静态媒体不设防。
+_Avoid_: 按"哪个端点"给这类请求分类——分类依据是**谁发起的请求**；把三种现状当作有意的分级设计。
+
+**自带认证端点（self-authenticated endpoint）**：
+不走 router 级 Bearer 依赖、在端点内部自行校验凭证的端点，成因一律是浏览器直发请求。注册时挂在 `self_auth_router` 上，与匿名可达的公开端点写法相同但性质不同。
+_Avoid_: 与公开端点混为一谈——自带认证端点拦得住匿名请求，公开端点拦不住。
 
 ## 示例对话
 

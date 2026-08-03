@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 from lib.api_errors import ApiError, BadRequestError, NotFoundError
 from lib.asset_fingerprints import compute_asset_fingerprints
 from lib.config.registry import default_model_for_provider
-from lib.config.resolver import ConfigResolver
+from lib.config.resolver import ConfigResolver, VideoBucketCapabilityError
 from lib.db import async_session_factory
 from lib.i18n import Translator
 from lib.json_io import domain_error_on_value_error
@@ -52,6 +52,10 @@ from server.services.project_cover import resolve_project_cover
 
 router = APIRouter()
 
+# 自带认证端点：浏览器原生下载导航带不了 Authorization header，
+# 端点内 verify_download_token 校验短时效下载 token，注册时不挂 Bearer 依赖。
+self_auth_router = APIRouter()
+
 # episode 字段白名单：只允许持久化合法的 on-disk 字段。
 # StatusCalculator 注入的统计字段（scenes_count / status / storyboards / videos 等）
 # 是读时计算值，禁止写回 project.json。title 不在白名单：它以剧本顶层 title 为唯一真相源，
@@ -65,6 +69,21 @@ def get_status_calculator() -> StatusCalculator:
 
 def get_archive_service() -> ProjectArchiveService:
     return ProjectArchiveService(get_project_manager())
+
+
+# 项目级模型字段：创建时逐一校验并写入 project.json，PATCH 时另加 audio_backend。
+# 值形如 provider/model 或裸 provider，空值 = 清除该层、回退下一层。
+_PROJECT_BACKEND_FIELDS = (
+    "video_backend",
+    "video_provider_i2v",
+    "video_provider_r2v",
+    "image_provider_t2i",
+    "image_provider_i2i",
+    "default_image_backend",
+    "text_backend_simple",
+    "text_backend_complex",
+    "default_text_backend",
+)
 
 
 class CreateProjectRequest(BaseModel):
@@ -85,9 +104,16 @@ class CreateProjectRequest(BaseModel):
     # ===== 新增 =====
     style_template_id: str | None = None
     video_backend: str | None = None
+    # 视频能力桶（docs/adr/0054）项目级覆盖：i2v = 图生视频 / 宫格，r2v = 参考生视频；
+    # 空值 = 回退项目默认（video_backend）与全局层
+    video_provider_i2v: str | None = None
+    video_provider_r2v: str | None = None
     image_backend: str | None = None
+    # 图片能力桶（docs/adr/0054）项目级覆盖 + 项目默认模型：t2i = 文生图，i2i = 图生图；
+    # 桶为空 = 回退项目默认（default_image_backend）与全局层
     image_provider_t2i: str | None = None
     image_provider_i2i: str | None = None
+    default_image_backend: str | None = None
     # 文本任务档位（docs/adr/0051）项目级覆盖 + 项目默认模型；空值 = 继承全局
     text_backend_simple: str | None = None
     text_backend_complex: str | None = None
@@ -122,9 +148,12 @@ class UpdateProjectRequest(BaseModel):
     brief: str | None = None
     generation_mode: str | None = None
     video_backend: str | None = None
+    video_provider_i2v: str | None = None
+    video_provider_r2v: str | None = None
     image_backend: str | None = None
     image_provider_t2i: str | None = None
     image_provider_i2i: str | None = None
+    default_image_backend: str | None = None
     video_generate_audio: bool | None = None
     # 旁白配音（TTS）项目级覆盖：音频后端 / 音色 / 语速；留空 = 跟随全局默认
     audio_backend: str | None = None
@@ -153,7 +182,6 @@ def _cleanup_temp_dir(dir_path: str) -> None:
 
 @router.post("/projects/import")
 async def import_project_archive(
-    _user: CurrentUser,
     _t: Translator,
     file: UploadFile = File(...),
     conflict_policy: str = Form("prompt"),
@@ -253,7 +281,7 @@ async def create_export_token(
         raise HTTPException(status_code=500, detail=_t("internal_server_error"))
 
 
-@router.get("/projects/{name}/export")
+@self_auth_router.get("/projects/{name}/export")
 async def export_project_archive(
     name: str,
     _t: Translator,
@@ -315,7 +343,7 @@ def _validate_draft_path(draft_path: str, _t: Callable[..., str]) -> str:
     return draft_path.strip()
 
 
-@router.get("/projects/{name}/export/jianying-draft")
+@self_auth_router.get("/projects/{name}/export/jianying-draft")
 def export_jianying_draft(
     name: str,
     _t: Translator,
@@ -375,7 +403,7 @@ def export_jianying_draft(
 
 
 @router.get("/projects")
-async def list_projects(_user: CurrentUser):
+async def list_projects():
     """列出所有项目"""
 
     def _sync():
@@ -455,7 +483,6 @@ async def list_projects(_user: CurrentUser):
 @router.post("/projects")
 async def create_project(
     req: CreateProjectRequest,
-    _user: CurrentUser,
     _t: Translator,
 ):
     """创建新项目"""
@@ -498,14 +525,7 @@ async def create_project(
                     raise HTTPException(status_code=400, detail=_t("ad_only_field", field="brief"))
 
             # 与 update 路径对称：校验所有 backend 字段
-            for field_name in (
-                "video_backend",
-                "image_provider_t2i",
-                "image_provider_i2i",
-                "text_backend_simple",
-                "text_backend_complex",
-                "default_text_backend",
-            ):
+            for field_name in _PROJECT_BACKEND_FIELDS:
                 value = getattr(req, field_name)
                 if value:
                     validate_backend_value(value, field_name, _t)
@@ -514,18 +534,7 @@ async def create_project(
                 manager.create_project(project_name, content_mode=req.content_mode or "narration")
             except FileExistsError:
                 raise HTTPException(status_code=400, detail=_t("project_exists", name=project_name))
-            extras = {
-                field: value
-                for field in (
-                    "video_backend",
-                    "image_provider_t2i",
-                    "image_provider_i2i",
-                    "text_backend_simple",
-                    "text_backend_complex",
-                    "default_text_backend",
-                )
-                if (value := getattr(req, field))
-            }
+            extras = {field: value for field in _PROJECT_BACKEND_FIELDS if (value := getattr(req, field))}
             if req.model_settings is not None:
                 extras["model_settings"] = req.model_settings
             # generation_mode 并入 extras 一次性写入，避免 create 后再 load-save 的额外 RMW
@@ -562,9 +571,9 @@ async def create_project(
 @router.get("/projects/{name}/video-capabilities")
 async def get_video_capabilities(
     name: str,
-    _user: CurrentUser,
     _t: Translator,
     video_backend: Annotated[str | None, Query()] = None,
+    episode: Annotated[int | None, Query()] = None,
 ):
     """解析当前项目视频模型能力 + 用户项目偏好。
 
@@ -573,9 +582,12 @@ async def get_video_capabilities(
     所有 generation_mode（storyboard/grid/reference_video）都可复用。
 
     `video_backend`（"provider/model"）用于设置表单里尚未保存的候选模型：不带该参数时按已
-    落盘配置解析，带上则按候选模型 × 本项目的 generation_mode 解析，使 voice_consistency 等
+    落盘配置解析，带上则按候选模型 × 本项目的生效 generation_mode 解析，使 voice_consistency 等
     二维派生值对应用户当前选中的模型而非上一次保存的模型。裸 provider（无 "/"）按其 registry
     默认视频 model 补全，与 project.json 存量裸 provider 覆盖同口径（见 `_parse_project_provider`）。
+
+    `episode` 用于按集查看的界面：生成模式可被单集覆盖，带上集号时能力按该集生效模式解析，
+    与执行层同口径；不带则只解析到项目级（设置页等无集号上下文的调用）。
     """
     resolver = ConfigResolver(async_session_factory)
     try:
@@ -586,10 +598,14 @@ async def get_video_capabilities(
             if not provider_id or not model_id:
                 raise BadRequestError("video_backend_malformed", value=video_backend)
             project = get_project_manager().load_project(name)
-            return await resolver.video_capabilities_for_model(provider_id, model_id, project)
-        return await resolver.video_capabilities(name)
+            return await resolver.video_capabilities_for_model(provider_id, model_id, project, episode)
+        return await resolver.video_capabilities(name, episode)
     except FileNotFoundError as exc:
         raise NotFoundError("project_not_found", name=name) from exc
+    except VideoBucketCapabilityError as exc:
+        # 能力桶解析闸的报错自带 errors 目录 key 与渲染参数，转成结构化 400 让用户看到修复指引，
+        # 不被下面的通用 422 文案吞掉（ValueError 子类，须先于其捕获）
+        raise BadRequestError(exc.code, **exc.params) from exc
     except ValueError as exc:
         # 异常原文只进日志：str(exc) 混英文技术细节，直接插进翻译文案会让 en/vi 界面混入未译原文
         logger.warning("项目 '%s' 视频模型能力解析失败: %s", name, exc)
@@ -602,7 +618,6 @@ async def get_video_capabilities(
 @router.get("/projects/{name}")
 async def get_project(
     name: str,
-    _user: CurrentUser,
     _t: Translator,
 ):
     """获取项目详情（含实时计算字段）"""
@@ -657,7 +672,7 @@ async def get_project(
 
 
 @router.patch("/projects/{name}")
-async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUser, _t: Translator):
+async def update_project(name: str, req: UpdateProjectRequest, _t: Translator):
     """更新项目元数据"""
     try:
 
@@ -686,15 +701,7 @@ async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUse
                     project["title"] = req.title
                 if req.style is not None:
                     project["style"] = req.style
-                for field in (
-                    "video_backend",
-                    "image_provider_t2i",
-                    "image_provider_i2i",
-                    "audio_backend",
-                    "text_backend_simple",
-                    "text_backend_complex",
-                    "default_text_backend",
-                ):
+                for field in (*_PROJECT_BACKEND_FIELDS, "audio_backend"):
                     if field in req.model_fields_set:
                         value = getattr(req, field)
                         if value:
@@ -832,7 +839,7 @@ async def update_project(name: str, req: UpdateProjectRequest, _user: CurrentUse
 
 
 @router.delete("/projects/{name}")
-async def delete_project(name: str, _user: CurrentUser, _t: Translator):
+async def delete_project(name: str, _t: Translator):
     """删除项目"""
     try:
 
@@ -851,7 +858,7 @@ async def delete_project(name: str, _user: CurrentUser, _t: Translator):
 
 
 @router.get("/projects/{name}/scripts/{script_file}")
-async def get_script(name: str, script_file: str, _user: CurrentUser, _t: Translator):
+async def get_script(name: str, script_file: str, _t: Translator):
     """获取剧本内容"""
     try:
         script = await asyncio.to_thread(get_project_manager().load_script, name, script_file)
@@ -871,7 +878,7 @@ class UpdateSceneRequest(BaseModel):
 
 
 @router.patch("/projects/{name}/script-scenes/{scene_id}")
-async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _user: CurrentUser, _t: Translator):
+async def update_scene(name: str, scene_id: str, req: UpdateSceneRequest, _t: Translator):
     """更新 drama 模式剧本中的单个场景镜头（按 scene_id 定位）。
 
     路径与项目场景资产 CRUD（``/projects/{name}/scenes/{entry_name}``）做明确区分，
@@ -977,7 +984,7 @@ def _require_ad_script(script: dict, _t: Translator) -> list[dict]:
 
 
 @router.patch("/projects/{name}/script-shots/{shot_id}")
-async def update_shot(name: str, shot_id: str, req: UpdateShotRequest, _user: CurrentUser, _t: Translator):
+async def update_shot(name: str, shot_id: str, req: UpdateShotRequest, _t: Translator):
     """更新 ad 模式剧本中的单个镜头（按 shot_id 定位）。
 
     路径风格与 ``script-scenes`` 对齐；口播文案 / section / 时长 / 引用列表等
@@ -1030,7 +1037,7 @@ class ReorderShotsRequest(BaseModel):
 
 
 @router.post("/projects/{name}/script-shots/reorder")
-async def reorder_shots(name: str, req: ReorderShotsRequest, _user: CurrentUser, _t: Translator):
+async def reorder_shots(name: str, req: ReorderShotsRequest, _t: Translator):
     """按给定全排列重排 ad 剧本的 shots 顺序（与参考视频 units/reorder 同语义）。"""
     try:
 
@@ -1097,7 +1104,7 @@ class UpdateEpisodeRequest(BaseModel):
 
 
 @router.patch("/projects/{name}/segments/{segment_id}")
-async def update_segment(name: str, segment_id: str, req: UpdateSegmentRequest, _user: CurrentUser, _t: Translator):
+async def update_segment(name: str, segment_id: str, req: UpdateSegmentRequest, _t: Translator):
     """更新说书模式片段"""
     try:
 
@@ -1155,7 +1162,7 @@ async def update_segment(name: str, segment_id: str, req: UpdateSegmentRequest, 
 
 
 @router.patch("/projects/{name}/episodes/{episode}")
-async def update_episode(name: str, episode: int, req: UpdateEpisodeRequest, _user: CurrentUser, _t: Translator):
+async def update_episode(name: str, episode: int, req: UpdateEpisodeRequest, _t: Translator):
     """更新分集顶层元数据（当前仅标题）。
 
     以剧本 scripts/*.json 顶层 title 为唯一真相源：走 locked_episode_script 在
@@ -1218,7 +1225,6 @@ async def update_episode(name: str, episode: int, req: UpdateEpisodeRequest, _us
 @router.post("/projects/{name}/source")
 async def set_project_source(
     name: Annotated[str, FastAPIPath(pattern=r"^[a-zA-Z0-9_-]+$")],
-    _user: CurrentUser,
     _t: Translator,
     generate_overview: Annotated[bool, Form()] = True,
     content: Annotated[str | None, Form()] = None,
@@ -1316,7 +1322,7 @@ async def set_project_source(
 
 
 @router.post("/projects/{name}/generate-overview")
-async def generate_overview(name: str, _user: CurrentUser, _t: Translator):
+async def generate_overview(name: str, _t: Translator):
     """使用 AI 生成项目概述"""
     try:
         get_project_manager().get_project_path(name)
@@ -1369,7 +1375,7 @@ async def generate_overview(name: str, _user: CurrentUser, _t: Translator):
 
 
 @router.patch("/projects/{name}/overview")
-async def update_overview(name: str, req: UpdateOverviewRequest, _user: CurrentUser, _t: Translator):
+async def update_overview(name: str, req: UpdateOverviewRequest, _t: Translator):
     """更新项目概述（手动编辑）"""
     try:
 

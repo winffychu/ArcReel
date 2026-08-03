@@ -35,7 +35,6 @@ from lib.config.service import ConfigService
 from lib.db import get_async_session
 from lib.httpx_shared import get_http_client
 from lib.i18n import Translator
-from server.auth import CurrentUser
 from server.dependencies import get_config_service
 from server.routers._validators import validate_backend_value
 
@@ -247,6 +246,9 @@ class ModelCandidatesResponse(BaseModel):
 
 class SystemConfigPatchRequest(BaseModel):
     default_video_backend: str | None = None
+    # 视频能力桶（docs/adr/0054）：i2v = 图生视频 / 宫格，r2v = 参考生视频；空值 = 回退默认层
+    default_video_backend_i2v: str | None = None
+    default_video_backend_r2v: str | None = None
     default_image_backend: str | None = None
     default_image_backend_t2i: str | None = None
     default_image_backend_i2i: str | None = None
@@ -293,7 +295,6 @@ _STRING_SETTINGS = (
 
 @router.get("/system/config")
 async def get_system_config(
-    _user: CurrentUser,
     svc: Annotated[ConfigService, Depends(get_config_service)],
     session: AsyncSession = Depends(get_async_session),
 ) -> dict[str, Any]:
@@ -320,6 +321,8 @@ async def get_system_config(
 
     settings: dict[str, Any] = {
         "default_video_backend": all_s.get("default_video_backend", ""),
+        "default_video_backend_i2v": all_s.get("default_video_backend_i2v", ""),
+        "default_video_backend_r2v": all_s.get("default_video_backend_r2v", ""),
         "default_image_backend": all_s.get("default_image_backend", ""),
         "default_image_backend_t2i": all_s.get("default_image_backend_t2i", ""),
         "default_image_backend_i2i": all_s.get("default_image_backend_i2i", ""),
@@ -351,7 +354,6 @@ async def get_system_config(
 
 @router.get("/system/config/model-candidates", response_model=ModelCandidatesResponse)
 async def get_model_candidates(
-    _user: CurrentUser,
     svc: Annotated[ConfigService, Depends(get_config_service)],
     session: AsyncSession = Depends(get_async_session),
 ) -> ModelCandidatesResponse:
@@ -379,7 +381,6 @@ async def get_model_candidates(
 
 @router.get("/system/version")
 async def get_system_version(
-    _user: CurrentUser,
     _t: Translator,
 ) -> dict[str, Any]:
     try:
@@ -419,7 +420,6 @@ async def get_system_version(
 @router.patch("/system/config")
 async def patch_system_config(
     req: SystemConfigPatchRequest,
-    _user: CurrentUser,
     svc: Annotated[ConfigService, Depends(get_config_service)],
     _t: Translator,
     session: AsyncSession = Depends(get_async_session),
@@ -431,6 +431,8 @@ async def patch_system_config(
     # Validate backend references (empty string = auto-resolve)
     for backend_key in (
         "default_video_backend",
+        "default_video_backend_i2v",
+        "default_video_backend_r2v",
         "default_image_backend",
         "default_image_backend_t2i",
         "default_image_backend_i2i",
@@ -496,4 +498,4 @@ async def patch_system_config(
     await session.commit()
 
     # Return updated config
-    return await get_system_config(_user=_user, svc=svc, session=session)
+    return await get_system_config(svc=svc, session=session)

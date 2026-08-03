@@ -20,7 +20,7 @@ import { EpisodeHeader } from "./EpisodeHeader";
 import { ReferenceDurationConfirmDialog } from "./ReferenceDurationConfirmDialog";
 import { computeVoiceLegacyNotice, VoiceLegacyBanner } from "./VoiceLegacyBanner";
 import { useReferenceDurationGate } from "@/hooks/useReferenceDurationGate";
-import { ScriptReviewGate } from "@/components/canvas/timeline/ScriptReviewGate";
+import { ReferenceStep1PreviewPanel } from "@/components/canvas/reference/ReferenceStep1PreviewPanel";
 import { API } from "@/api";
 import { enqueueReferenceVideoUnit } from "@/actions/generation";
 import {
@@ -476,6 +476,17 @@ export function ReferenceVideoCanvas({
 
   const hasAnyDraft = Object.keys(drafts).length > 0;
 
+  // 草稿已落盘 → 丢弃本地草稿。若这期间用户又敲了字（草稿值已变），保留新草稿不动，
+  // 否则落盘响应回来时会把用户刚输入的内容抹掉。
+  const clearFlushedDraft = useCallback((key: string, flushed: string) => {
+    setDrafts((d) => {
+      if (d[key] !== flushed) return d;
+      const copy = { ...d };
+      delete copy[key];
+      return copy;
+    });
+  }, []);
+
   const handleSave = useCallback(async () => {
     if (!selected) return;
     const unitId = selected.unit_id;
@@ -489,18 +500,13 @@ export function ReferenceVideoCanvas({
         prompt: draftText,
         references: nextRefs,
       });
-      setDrafts((d) => {
-        if (d[key] !== draftText) return d;
-        const copy = { ...d };
-        delete copy[key];
-        return copy;
-      });
+      clearFlushedDraft(key, draftText);
     } catch (e) {
       toastError(e);
     } finally {
       setSaving(false);
     }
-  }, [selected, drafts, project, patchUnit, projectName, episode]);
+  }, [selected, drafts, project, patchUnit, projectName, episode, clearFlushedDraft]);
 
   // Reference reorder/add/remove flushes immediately, carrying any pending prompt draft.
   const patchReferencesAtomic = useCallback(
@@ -510,24 +516,21 @@ export function ReferenceVideoCanvas({
       const unit = units.find((u) => u.unit_id === unitId);
       const hasDraft =
         draftText !== undefined && unit !== undefined && draftText !== unitPromptText(unit);
+      // draftText 未落盘时，chip 操作请求的 nextRefs 仍基于旧 prompt 状态；按新 draftText
+      // 重新派生，同时把 nextRefs 作为 mergeReferences 的 existing 基准——保留本次 chip
+      // 操作请求的顺序（拖拽结果），只补丢弃/新增仅由文本变化引起的部分。
       const body: { prompt?: string; references: ReferenceResource[] } = hasDraft
-        ? { prompt: draftText, references: nextRefs }
+        ? { prompt: draftText, references: mergeReferences(draftText, nextRefs, project ?? null) }
         : { references: nextRefs };
       void patchUnit(projectName, episode, unitId, body)
         .then(() => {
-          if (!hasDraft) return;
-          setDrafts((d) => {
-            if (d[key] !== draftText) return d;
-            const copy = { ...d };
-            delete copy[key];
-            return copy;
-          });
+          if (hasDraft) clearFlushedDraft(key, draftText);
         })
         .catch((e) => {
           toastError(e);
         });
     },
-    [drafts, units, patchUnit, projectName, episode],
+    [drafts, units, patchUnit, projectName, episode, project, clearFlushedDraft],
   );
 
   const handleReorderRefs = useCallback(
@@ -691,23 +694,6 @@ export function ReferenceVideoCanvas({
         <button
           type="button"
           role="tab"
-          aria-selected={tab === "units"}
-          onClick={() => setTab("units")}
-          className={`focus-ring relative px-3.5 py-2.5 text-[12.5px] font-medium ${
-            tab === "units" ? "text-[var(--color-text)]" : "text-[var(--color-text-3)]"
-          }`}
-        >
-          {t("reference_tab_units")}
-          {tab === "units" && (
-            <span
-              aria-hidden="true"
-              className="absolute -bottom-px left-2.5 right-2.5 h-0.5 rounded bg-[var(--color-accent)]"
-            />
-          )}
-        </button>
-        <button
-          type="button"
-          role="tab"
           aria-selected={tab === "preproc"}
           onClick={() => setTab("preproc")}
           className={`focus-ring relative inline-flex items-center gap-1.5 px-3.5 py-2.5 text-[12.5px] font-medium ${
@@ -724,6 +710,23 @@ export function ReferenceVideoCanvas({
             />
           )}
           {tab === "preproc" && (
+            <span
+              aria-hidden="true"
+              className="absolute -bottom-px left-2.5 right-2.5 h-0.5 rounded bg-[var(--color-accent)]"
+            />
+          )}
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "units"}
+          onClick={() => setTab("units")}
+          className={`focus-ring relative px-3.5 py-2.5 text-[12.5px] font-medium ${
+            tab === "units" ? "text-[var(--color-text)]" : "text-[var(--color-text-3)]"
+          }`}
+        >
+          {t("reference_tab_units")}
+          {tab === "units" && (
             <span
               aria-hidden="true"
               className="absolute -bottom-px left-2.5 right-2.5 h-0.5 rounded bg-[var(--color-accent)]"
@@ -764,11 +767,11 @@ export function ReferenceVideoCanvas({
       {tab === "preproc" ? (
         <div className="min-h-0 flex-1 overflow-auto bg-[oklch(0.18_0.011_250_/_0.25)]">
           <div className="mx-auto w-full max-w-3xl px-6 py-5">
-            <ScriptReviewGate
+            <ReferenceStep1PreviewPanel
               key={`${projectName}:${episode}`}
               projectName={projectName}
               episode={episode}
-              contentMode="reference_video"
+              lookup={mentionLookup}
             />
           </div>
         </div>

@@ -20,6 +20,7 @@ from lib.db.base import Base
 from server.auth import CurrentUserInfo, get_current_user
 from server.dependencies import get_config_service
 from server.routers import system_config as system_config_router
+from tests.auth_deps import AUTH_DEPENDENCIES
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -59,7 +60,7 @@ def _make_app_with_mock(mock_svc: ConfigService) -> FastAPI:
             yield session
 
     app.dependency_overrides[get_async_session] = _override_session
-    app.include_router(system_config_router.router, prefix="/api/v1")
+    app.include_router(system_config_router.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
     return app
 
 
@@ -139,6 +140,8 @@ class TestGetSystemConfig:
         settings = res.json()["settings"]
         expected_keys = {
             "default_video_backend",
+            "default_video_backend_i2v",
+            "default_video_backend_r2v",
             "default_image_backend",
             "default_image_backend_t2i",
             "default_image_backend_i2i",
@@ -270,7 +273,7 @@ class TestGetSystemConfig:
 
     def test_video_generate_audio_defaults_to_true_on_empty_db(self):
         """新装系统 DB 为空时，GET /system/config 应返回 video_generate_audio=True，
-        与 ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO=True 保持一致（PR7 §11）。"""
+        与 ConfigResolver._DEFAULT_VIDEO_GENERATE_AUDIO=True 保持一致。"""
         mock_svc = _make_mock_svc(settings={})
         with TestClient(_make_app_with_mock(mock_svc)) as client:
             res = client.get("/api/v1/system/config")
@@ -304,7 +307,7 @@ class TestPatchSystemConfig:
             yield mock_session
 
         app.dependency_overrides[get_async_session] = _override_session
-        app.include_router(system_config_router.router, prefix="/api/v1")
+        app.include_router(system_config_router.router, prefix="/api/v1", dependencies=AUTH_DEPENDENCIES)
         return app
 
     def test_patch_returns_200(self):
@@ -326,6 +329,44 @@ class TestPatchSystemConfig:
         assert res.status_code == 200
         settings = res.json()["settings"]
         assert settings["default_video_backend"] == "ark/doubao-seedance-1-5-pro-251215"
+
+    @pytest.mark.unit
+    def test_patch_sets_video_bucket_backends(self):
+        mock_svc = _make_mock_svc()
+        with TestClient(self._make_patch_app(mock_svc)) as client:
+            res = client.patch(
+                "/api/v1/system/config",
+                json={
+                    "default_video_backend_i2v": "minimax/MiniMax-Hailuo-2.3",
+                    "default_video_backend_r2v": "minimax/S2V-01",
+                },
+            )
+        assert res.status_code == 200
+        settings = res.json()["settings"]
+        assert settings["default_video_backend_i2v"] == "minimax/MiniMax-Hailuo-2.3"
+        assert settings["default_video_backend_r2v"] == "minimax/S2V-01"
+
+    @pytest.mark.unit
+    def test_patch_clears_video_bucket_backend(self):
+        """空串 = 清空桶键；解析层按空桶回退默认层处理（docs/adr/0054）。"""
+        mock_svc = _make_mock_svc(settings={"default_video_backend_r2v": "minimax/S2V-01"})
+        with TestClient(self._make_patch_app(mock_svc)) as client:
+            res = client.patch(
+                "/api/v1/system/config",
+                json={"default_video_backend_r2v": ""},
+            )
+        assert res.status_code == 200
+        assert res.json()["settings"]["default_video_backend_r2v"] == ""
+
+    @pytest.mark.unit
+    def test_patch_rejects_non_video_model_in_video_bucket(self):
+        mock_svc = _make_mock_svc()
+        with TestClient(self._make_patch_app(mock_svc)) as client:
+            res = client.patch(
+                "/api/v1/system/config",
+                json={"default_video_backend_i2v": "gemini-aistudio/gemini-3.1-flash-image-preview"},
+            )
+        assert res.status_code == 400
 
     def test_patch_rejects_invalid_backend_format(self):
         mock_svc = _make_mock_svc()

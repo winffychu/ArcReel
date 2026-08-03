@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from lib.config.resolver import ConfigResolver
 from lib.script_generator import ScriptGenerator, _units_use_references
 from lib.script_structure_validator import ScriptStructureValidationError
 
@@ -62,7 +63,6 @@ def _write_drama_ledger_project(project_path: Path, episodes: list[dict], charac
             "characters": characters or {},
             "style": "古风",
             "style_description": "cinematic",
-            "_supported_durations": [4, 6, 8],
             "episodes": episodes,
         },
     )
@@ -73,7 +73,6 @@ def _drama_project_with_backend(
     *,
     backend: str,
     resolution: str,
-    supported_durations: list[int] | None = None,
 ):
     """造一个指定视频后端 + 分辨率的最小 drama 项目，返回项目路径。
 
@@ -87,8 +86,6 @@ def _drama_project_with_backend(
     project = json.loads((project_path / "project.json").read_text(encoding="utf-8"))
     project["video_backend"] = backend
     project["model_settings"] = {backend: {"resolution": resolution}}
-    if supported_durations is not None:
-        project["_supported_durations"] = supported_durations
     _write_json(project_path / "project.json", project)
     return project_path
 
@@ -178,12 +175,12 @@ class TestScriptGenerator:
                 "clues": {"玉佩": {}},
                 "style": "古风",
                 "style_description": "cinematic",
-                "_supported_durations": [4, 6, 8],
             },
         )
         _write_step1_json(project_path, 1, [_step1_seg("E1S01", "第一段原文，逐字保留。", duration=4)])
 
         generator = ScriptGenerator(project_path)  # 无 client
+        generator._fetch_video_capabilities = _fixed_caps_468
         prompt = await generator.build_prompt(1)
 
         assert "E1S01" in prompt
@@ -205,12 +202,12 @@ class TestScriptGenerator:
                 "style": "古风",
                 "style_description": "cinematic",
                 "source_language": "English",
-                "_supported_durations": [4, 6, 8],
             },
         )
         _write_step1_json(project_path, 1, [_step1_seg("E1S01", "verbatim source line.", duration=4)])
 
         generator = ScriptGenerator(project_path)
+        generator._fetch_video_capabilities = _fixed_caps_468
         prompt = await generator.build_prompt(1)
 
         # 输出语言锁定为项目 source_language，不回落默认中文
@@ -339,7 +336,7 @@ class TestScriptGenerator:
         content["scenes"][0]["duration_seconds"] = 4
         generator = ScriptGenerator(project_path)
         with pytest.raises(ValueError, match="step1 已定场景时长非法"):
-            await generator._assert_drama_step1_durations(content["scenes"], gen_mode="storyboard")
+            await generator._assert_drama_step1_durations(content["scenes"], episode=1, gen_mode="storyboard")
 
     @pytest.mark.integration
     @pytest.mark.parametrize(
@@ -360,7 +357,7 @@ class TestScriptGenerator:
         content["scenes"][0]["duration_seconds"] = raw
         generator = ScriptGenerator(project_path)
         with pytest.raises(ValueError, match="step1 已定场景时长非法"):
-            await generator._assert_drama_step1_durations(content["scenes"], gen_mode="storyboard")
+            await generator._assert_drama_step1_durations(content["scenes"], episode=1, gen_mode="storyboard")
 
     @pytest.mark.integration
     async def test_drama_step2_checks_declared_default_when_duration_absent(self, tmp_path):
@@ -368,15 +365,13 @@ class TestScriptGenerator:
 
         海螺 1080p 只接受 6 秒，而 DramaSceneContent 的默认是 8 秒，故该场景须被拦下。
         """
-        project_path = _drama_project_with_backend(
-            tmp_path, backend="minimax/MiniMax-Hailuo-2.3", resolution="1080p", supported_durations=[6, 10]
-        )
+        project_path = _drama_project_with_backend(tmp_path, backend="minimax/MiniMax-Hailuo-2.3", resolution="1080p")
 
         content = _drama_step1_content()
         del content["scenes"][0]["duration_seconds"]
         generator = ScriptGenerator(project_path)
         with pytest.raises(ValueError, match="step1 已定场景时长非法"):
-            await generator._assert_drama_step1_durations(content["scenes"], gen_mode="storyboard")
+            await generator._assert_drama_step1_durations(content["scenes"], episode=1, gen_mode="storyboard")
 
     @pytest.mark.integration
     async def test_drama_step2_checks_declared_default_when_duration_null(self, tmp_path):
@@ -385,15 +380,13 @@ class TestScriptGenerator:
         `dict.get` 的默认值只在缺键时生效，显式 null 会取到 None；不特判的话该场景跳过校验，
         要等 step2 跑完、落盘时才被 Pydantic 拒，白耗一次完整的剧本生成调用。
         """
-        project_path = _drama_project_with_backend(
-            tmp_path, backend="minimax/MiniMax-Hailuo-2.3", resolution="1080p", supported_durations=[6, 10]
-        )
+        project_path = _drama_project_with_backend(tmp_path, backend="minimax/MiniMax-Hailuo-2.3", resolution="1080p")
 
         content = _drama_step1_content()
         content["scenes"][0]["duration_seconds"] = None
         generator = ScriptGenerator(project_path)
         with pytest.raises(ValueError, match="step1 已定场景时长非法"):
-            await generator._assert_drama_step1_durations(content["scenes"], gen_mode="storyboard")
+            await generator._assert_drama_step1_durations(content["scenes"], episode=1, gen_mode="storyboard")
 
     @pytest.mark.integration
     async def test_drama_step2_accepts_step1_duration_within_constrained_set(self, tmp_path):
@@ -403,7 +396,9 @@ class TestScriptGenerator:
         )
 
         generator = ScriptGenerator(project_path)
-        await generator._assert_drama_step1_durations(_drama_step1_content()["scenes"], gen_mode="storyboard")
+        await generator._assert_drama_step1_durations(
+            _drama_step1_content()["scenes"], episode=1, gen_mode="storyboard"
+        )
 
     async def test_drama_step2_build_prompt_renders_step1_content(self, tmp_path):
         """drama step2（视觉层）build_prompt 须把 step1 已定稿内容渲染入 prompt，仅求视觉字段。"""
@@ -502,7 +497,6 @@ class TestScriptGenerator:
                 "clues": {"玉佩": {}},
                 "style": "古风",
                 "style_description": "cinematic",
-                "_supported_durations": [4, 6, 8],
             },
         )
         _write_step1_json(
@@ -553,6 +547,7 @@ class TestScriptGenerator:
         # drama 两段式：step2 LLM 只出视觉层，后端按 scene_id 合并回 step1 内容
         fake = _FakeTextGenerator(json.dumps(_drama_visual_response(), ensure_ascii=False))
         generator = ScriptGenerator(project_path, generator=fake)
+        generator._fetch_video_capabilities = _fixed_caps_468
         output = await generator.generate(1)
 
         payload = json.loads(output.read_text(encoding="utf-8"))
@@ -576,7 +571,6 @@ class TestScriptGenerator:
                 "characters": {"姜月茴": {}},
                 "style": "古风",
                 "style_description": "cinematic",
-                "_supported_durations": [4, 6, 8],
                 "episodes": [
                     {"episode": 1, "title": "第一集", "script_file": "scripts/episode_1.json"},
                 ],
@@ -608,7 +602,6 @@ class TestScriptGenerator:
                 "clues": {"玉佩": {}},
                 "style": "古风",
                 "style_description": "cinematic",
-                "_supported_durations": [4, 6, 8],
             },
         )
         # step1 误写集号前缀 E1（应为 E10）
@@ -639,6 +632,7 @@ class TestScriptGenerator:
 
         fake = _FakeTextGenerator(json.dumps(_drama_visual_response(), ensure_ascii=False))
         generator = ScriptGenerator(project_path, generator=fake)
+        generator._fetch_video_capabilities = _fixed_caps_468
         await generator.generate(1)
 
         schema = fake.backend.last_request.response_schema
@@ -665,6 +659,7 @@ class TestScriptGenerator:
         # 空视觉响应 → 合并时 step1 场景缺视觉，fail-loud；但模型调用已发生，仍可断言请求参数
         fake = _FakeTextGenerator(json.dumps({"foo": "bar"}))
         generator = ScriptGenerator(project_path, generator=fake)
+        generator._fetch_video_capabilities = _fixed_caps_468
         with pytest.raises(DramaVisualMergeError):
             await generator.generate(1)
 
@@ -716,7 +711,6 @@ class TestAddMetadataRewritesEpisodePrefix:
             {
                 "title": "项目",
                 "content_mode": content_mode,
-                "_supported_durations": [4, 6, 8],
             },
         )
         return ScriptGenerator(project_path)
@@ -754,7 +748,6 @@ class TestAddMetadataRewritesEpisodePrefix:
                 "title": "项目",
                 "content_mode": "narration",
                 "generation_mode": "reference_video",
-                "_supported_durations": [8],
             },
         )
         sg = ScriptGenerator(project_path)
@@ -800,7 +793,6 @@ class TestAddMetadataInjectsHiddenFields:
             {
                 "title": "项目标题",
                 "content_mode": content_mode,
-                "_supported_durations": [4, 6, 8],
             },
         )
         return ScriptGenerator(project_path)
@@ -914,6 +906,72 @@ def test_resolve_supported_durations_raises_when_unset(tmp_path):
 
     with pytest.raises(ValueError, match="supported_durations"):
         sg._resolve_supported_durations(None, gen_mode="storyboard")
+
+
+class TestFetchVideoCapabilitiesErrorHandling:
+    """能力桶解析闸的报错不被 fallback 吞掉——写剧本与执行读同一个模型的档位。"""
+
+    def _sg(self, tmp_path) -> ScriptGenerator:
+        sg = ScriptGenerator.__new__(ScriptGenerator)
+        sg.project_path = tmp_path
+        sg.project_json = {"video_backend": "kling/kling-v3", "generation_mode": "reference_video"}
+        return sg
+
+    @pytest.mark.unit
+    async def test_bucket_capability_error_propagates(self, tmp_path, monkeypatch):
+        """桶模型缺能力 / 引用失效时上抛：退到 project.json 会拿项目默认模型的时长与参考图
+        上限写剧本，写出来的镜头执行期照样被同一道闸拒掉。"""
+        from lib.config.resolver import VideoBucketCapabilityError
+
+        async def _raise(_self, _project, _episode=None):
+            raise VideoBucketCapabilityError(
+                code="video_capability_missing_r2v",
+                capability="r2v",
+                provider_id="kling",
+                model_id="kling-v3",
+                message="video model kling/kling-v3 lacks the capability required by the r2v bucket",
+            )
+
+        monkeypatch.setattr(ConfigResolver, "video_capabilities_for_project", _raise)
+        with pytest.raises(VideoBucketCapabilityError) as excinfo:
+            await self._sg(tmp_path)._fetch_video_capabilities()
+        assert excinfo.value.code == "video_capability_missing_r2v"
+
+    @pytest.mark.unit
+    async def test_other_resolution_failures_still_fall_back(self, tmp_path, monkeypatch):
+        """DB 未 migration / 缺能力元数据等环境故障仍走 fallback，裸环境下 generate() 照常跑通。"""
+
+        async def _raise(_self, _project, _episode=None):
+            raise ValueError("no video provider configured")
+
+        monkeypatch.setattr(ConfigResolver, "video_capabilities_for_project", _raise)
+        assert await self._sg(tmp_path)._fetch_video_capabilities() is None
+
+
+class TestDegradedResolutionKeepsBucket:
+    """caps 解析失败后的降级路径仍按 generation_mode 定桶读 project.json，只丢 DB 那一层。"""
+
+    _PROJECT = {
+        "video_backend": "kling/kling-v3",
+        "video_provider_r2v": "gemini-aistudio/veo-3.1-generate-preview",
+        "generation_mode": "reference_video",
+    }
+
+    @pytest.mark.unit
+    def test_backend_ids_fall_back_to_bucket_key(self, tmp_path):
+        sg = _sg_with_project(tmp_path, dict(self._PROJECT))
+        assert sg._resolve_backend_ids(None) == ("gemini-aistudio", "veo-3.1-generate-preview")
+
+    @pytest.mark.unit
+    def test_max_refs_falls_back_to_bucket_model(self, tmp_path):
+        """参考视频项目降级后仍按 r2v 桶模型报上限；取项目默认层会拿到不接受参考图的 kling-v3。"""
+        sg = _sg_with_project(tmp_path, dict(self._PROJECT))
+        assert sg._resolve_max_refs(None) == 3
+
+    @pytest.mark.unit
+    def test_supported_durations_fall_back_to_bucket_model(self, tmp_path):
+        sg = _sg_with_project(tmp_path, dict(self._PROJECT))
+        assert sg._resolve_raw_supported_durations(None) == [4, 6, 8]
 
 
 def _sg_with_project(tmp_path, project: dict) -> ScriptGenerator:
@@ -1230,7 +1288,7 @@ def _narration_visual_response(segment_ids: list[str], *, title: str = "第一�
     return {"title": title, "segments": [_visual_seg(sid) for sid in segment_ids]}
 
 
-async def _fixed_caps_468() -> dict:
+async def _fixed_caps_468(_episode=None) -> dict:
     return {"supported_durations": [4, 6, 8]}
 
 
@@ -1550,7 +1608,6 @@ def _write_ad_project(project_path: Path, *, generation_mode: str = "storyboard"
         "style": "实拍",
         "style_description": "真实质感",
         "aspect_ratio": "9:16",
-        "_supported_durations": [4, 6, 8],
         "episodes": [{"episode": 1, "title": "", "script_file": "scripts/episode_1.json"}],
     }
     _write_json(project_path / "project.json", payload)
@@ -1586,6 +1643,7 @@ class TestAdScriptGeneration:
         _write_ad_project(project_path)
 
         generator = ScriptGenerator(project_path)
+        generator._fetch_video_capabilities = _fixed_caps_468
         prompt = await generator.build_prompt(1)
 
         assert "带货八段框架" in prompt
@@ -1616,6 +1674,7 @@ class TestAdScriptGeneration:
         _write_json(project_json_path, payload)
 
         generator = ScriptGenerator(project_path)
+        generator._fetch_video_capabilities = _fixed_caps_468
         prompt = await generator.build_prompt(1)
 
         # 口播语速折算按 en 口径（约 2.5 词/秒），不得回落默认 zh 口径（约 5 字/秒）
@@ -1644,12 +1703,12 @@ class TestAdScriptGeneration:
                 "style": None,
                 "style_description": None,
                 "aspect_ratio": "9:16",
-                "_supported_durations": [4, 6, 8],
                 "episodes": [{"episode": 1, "title": "", "script_file": "scripts/episode_1.json"}],
             },
         )
 
         generator = ScriptGenerator(project_path)
+        generator._fetch_video_capabilities = _fixed_caps_468
         prompt = await generator.build_prompt(1)
 
         # products 归一化为空 → 自动分流通用短片 prompt，不落带货框架
@@ -1671,7 +1730,7 @@ class TestAdScriptGeneration:
         fake = _FakeTextGenerator(json.dumps(response, ensure_ascii=False))
         generator = ScriptGenerator(project_path, generator=fake)
 
-        async def _fixed_caps():
+        async def _fixed_caps(_episode=None):
             return {"supported_durations": [4, 6, 8]}
 
         generator._fetch_video_capabilities = _fixed_caps
@@ -1695,7 +1754,7 @@ class TestAdScriptGeneration:
         fake = _FakeTextGenerator(json.dumps({"foo": "bar"}))
         generator = ScriptGenerator(project_path, generator=fake)
 
-        async def _fixed_caps():
+        async def _fixed_caps(_episode=None):
             return {"supported_durations": [4, 6, 8]}
 
         generator._fetch_video_capabilities = _fixed_caps
@@ -1744,7 +1803,7 @@ class TestAdScriptGeneration:
         fake = _FakeTextGenerator(json.dumps(response, ensure_ascii=False))
         generator = ScriptGenerator(project_path, generator=fake)
 
-        async def _fixed_caps():
+        async def _fixed_caps(_episode=None):
             return {"supported_durations": [4, 6, 8]}
 
         generator._fetch_video_capabilities = _fixed_caps
@@ -1867,7 +1926,7 @@ class TestAdQualityProbe:
         fake = _FakeTextGenerator(json.dumps(response, ensure_ascii=False))
         generator = ScriptGenerator(project_path, generator=fake)
 
-        async def _fixed_caps():
+        async def _fixed_caps(_episode=None):
             return {"supported_durations": [4, 6, 8]}
 
         generator._fetch_video_capabilities = _fixed_caps
