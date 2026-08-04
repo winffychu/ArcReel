@@ -55,6 +55,7 @@ MESSAGES = {
     "prompt_text_empty": "prompt 不能为空",
     "storyboard_task_submitted": "分镜「{segment_id}」生成任务已提交",
     "generate_storyboard_first": "请先生成分镜图 scene_{segment_id}.png",
+    "video_route_is_reference_video": "该项目是参考生视频路线，没有分镜图生视频这一步；请在参考生视频编辑器里按视频单元生成",
     "invalid_storyboard_image_path": "片段「{segment_id}」的分镜图引用无效，请重新生成分镜图",
     "video_prompt_must_be_string_or_action_object": "prompt 必须是字符串或包含 action/camera_motion 的对象",
     "video_prompt_action_empty": "prompt.action 不能为空",
@@ -100,6 +101,7 @@ MESSAGES = {
     "script_review_not_applicable": "该集不适用 step1 审核确认（该模式无结构化 step1 中间态）",
     "script_review_no_step1": "尚无 step1 结构化中间态可确认，请先完成预处理",
     "script_review_quarantined": "本集 step1 有违约产物待处置，请让智能体修复并晋升后再确认",
+    "script_review_conflict": "step1 内容在编辑期间已被其他编辑方修改，本次保存未覆盖；请刷新查看最新内容，合并后再保存",
     "script_review_invalid_content": "step1 中间态结构校验失败：{details}",
     "script_review_quarantine_unreadable": "隔离草稿文件已损坏或格式不符，无法读取，请让智能体重新拆分该集",
     "draft_event_label": "第 {episode} 集{label_prefix}",
@@ -235,6 +237,7 @@ MESSAGES = {
     "ref_warn_reference_audio_overflow": "参考音频最多 {limit} 段：角色「{name}」的台词声音将由模型自行决定",
     "ref_warn_speaker_audio_needs_image": "角色「{name}」没有参考图（纯画外）：当前视频模型要求参考音频逐段挂在参考图上，该角色的台词声音将由模型自行决定",
     "ref_warn_silent_model": "当前视频模型「{model}」不生成音频，台词仅用于提示词参考",
+    "ref_warn_silent_episode": "本集已关闭参考音频：不会上传参考音频，声音一致性不生效，台词仅用于提示词参考；成片是否有声音由所选模型决定",
     # Episode meta
     "episode_not_found": "第 {episode} 集不存在或尚无剧本文件",
     "episode_title_empty": "分集标题不能为空",

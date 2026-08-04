@@ -55,6 +55,7 @@ MESSAGES = {
     "prompt_text_empty": "prompt không được để trống",
     "storyboard_task_submitted": "Đã gửi tác vụ tạo phân cảnh cho '{segment_id}'",
     "generate_storyboard_first": "Vui lòng tạo phân cảnh scene_{segment_id}.png trước",
+    "video_route_is_reference_video": "Dự án này dùng lộ trình video tham chiếu, không có bước tạo video từ phân cảnh; hãy tạo theo đơn vị video trong trình chỉnh sửa video tham chiếu",
     "invalid_storyboard_image_path": "Đoạn '{segment_id}' có tham chiếu ảnh phân cảnh không hợp lệ, vui lòng tạo lại phân cảnh",
     "video_prompt_must_be_string_or_action_object": "prompt phải là chuỗi hoặc đối tượng chứa action/camera_motion",
     "video_prompt_action_empty": "prompt.action không được để trống",
@@ -101,6 +102,10 @@ MESSAGES = {
     "script_review_no_step1": "Chưa có bản nháp có cấu trúc Step 1 để xác nhận; vui lòng hoàn tất tiền xử lý trước",
     "script_review_quarantined": (
         "Tập này có bản nháp Step 1 vi phạm đang chờ xử lý; hãy để tác nhân sửa và thăng cấp trước khi xác nhận"
+    ),
+    "script_review_conflict": (
+        "Bản nháp Step 1 đã bị người chỉnh sửa khác thay đổi trong lúc bạn đang chỉnh sửa; lần lưu này chưa được áp dụng. "
+        "Hãy tải lại để xem nội dung mới nhất, hợp nhất thay đổi của bạn rồi lưu lại"
     ),
     "script_review_invalid_content": "Xác thực cấu trúc bản nháp Step 1 thất bại: {details}",
     "script_review_quarantine_unreadable": (
@@ -271,6 +276,11 @@ MESSAGES = {
     ),
     "ref_warn_silent_model": (
         "Mô hình video hiện tại '{model}' không tạo âm thanh, lời thoại chỉ dùng làm gợi ý cho prompt"
+    ),
+    "ref_warn_silent_episode": (
+        "Tập này đã tắt âm thanh tham chiếu: không tải lên âm thanh tham chiếu, tính nhất quán giọng nói "
+        "không có hiệu lực, lời thoại chỉ dùng làm gợi ý cho prompt; video hoàn chỉnh có tiếng hay không "
+        "tùy thuộc vào mô hình đã chọn"
     ),
     # Episode meta
     "episode_not_found": "Không tìm thấy tập {episode} hoặc tập chưa có tệp kịch bản",
