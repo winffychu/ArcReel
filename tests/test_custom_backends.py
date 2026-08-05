@@ -28,6 +28,7 @@ from lib.video_backends.base import (
 
 
 class TestCustomTextBackend:
+    @pytest.mark.unit
     def test_properties(self):
         delegate = AsyncMock()
         delegate.capabilities = {TextCapability.TEXT_GENERATION}
@@ -37,6 +38,7 @@ class TestCustomTextBackend:
         assert backend.model == "deepseek-v3"
         assert backend.capabilities == {TextCapability.TEXT_GENERATION}
 
+    @pytest.mark.unit
     def test_capabilities_delegated(self):
         """capabilities 属性直接来自 delegate。"""
         delegate = AsyncMock()
@@ -49,6 +51,7 @@ class TestCustomTextBackend:
 
         assert backend.capabilities is delegate.capabilities
 
+    @pytest.mark.unit
     async def test_generate_delegates(self):
         expected_result = TextGenerationResult(
             text="hello world",
@@ -68,6 +71,7 @@ class TestCustomTextBackend:
         assert result is expected_result
         delegate.generate.assert_awaited_once_with(request)
 
+    @pytest.mark.unit
     async def test_generate_passes_request_unchanged(self):
         """generate() 不修改请求对象，原样传给 delegate。"""
         delegate = AsyncMock()
@@ -88,6 +92,7 @@ class TestCustomTextBackend:
 
 
 class TestCustomImageBackend:
+    @pytest.mark.unit
     def test_properties(self):
         delegate = AsyncMock()
         delegate.capabilities = {ImageCapability.TEXT_TO_IMAGE}
@@ -97,6 +102,7 @@ class TestCustomImageBackend:
         assert backend.model == "flux-1"
         assert backend.capabilities == {ImageCapability.TEXT_TO_IMAGE}
 
+    @pytest.mark.unit
     def test_capabilities_delegated(self):
         delegate = AsyncMock()
         delegate.capabilities = {ImageCapability.TEXT_TO_IMAGE, ImageCapability.IMAGE_TO_IMAGE}
@@ -104,6 +110,7 @@ class TestCustomImageBackend:
 
         assert backend.capabilities is delegate.capabilities
 
+    @pytest.mark.unit
     async def test_generate_delegates(self, tmp_path: Path):
         output_path = tmp_path / "output.png"
         expected_result = ImageGenerationResult(
@@ -122,6 +129,7 @@ class TestCustomImageBackend:
         assert result is expected_result
         delegate.generate.assert_awaited_once_with(request)
 
+    @pytest.mark.unit
     async def test_generate_passes_request_unchanged(self, tmp_path: Path):
         output_path = tmp_path / "img.png"
         delegate = AsyncMock()
@@ -144,6 +152,7 @@ class TestCustomImageBackend:
 
 
 class TestCustomVideoBackend:
+    @pytest.mark.unit
     def test_properties(self):
         delegate = AsyncMock()
         backend = CustomVideoBackend(provider_id="custom-vid", delegate=delegate, model="wan-pro")
@@ -151,6 +160,7 @@ class TestCustomVideoBackend:
         assert backend.name == "custom-vid"
         assert backend.model == "wan-pro"
 
+    @pytest.mark.unit
     async def test_generate_delegates(self, tmp_path: Path):
         output_path = tmp_path / "output.mp4"
         expected_result = VideoGenerationResult(
@@ -169,6 +179,7 @@ class TestCustomVideoBackend:
         assert result is expected_result
         delegate.generate.assert_awaited_once_with(request)
 
+    @pytest.mark.unit
     async def test_generate_passes_request_unchanged(self, tmp_path: Path):
         output_path = tmp_path / "vid.mp4"
         delegate = AsyncMock()
@@ -182,6 +193,26 @@ class TestCustomVideoBackend:
 
         call_args = delegate.generate.call_args[0]
         assert call_args[0] is request
+
+    @pytest.mark.unit
+    async def test_generate_injects_execution_endpoint(self, tmp_path: Path):
+        """记住 endpoint 的实例在转发前注入 request，让下游 backend 与 job_id 一并持久化。
+
+        注入走 replace 而非就地改写：request 由调用方持有，包装层不留副作用。
+        """
+        output_path = tmp_path / "vid.mp4"
+        delegate = AsyncMock()
+        delegate.generate = AsyncMock(
+            return_value=VideoGenerationResult(video_path=output_path, provider="x", model="y", duration_seconds=5)
+        )
+
+        backend = CustomVideoBackend(provider_id="p", delegate=delegate, model="m", endpoint="openai-video")
+        request = VideoGenerationRequest(prompt="test", output_path=output_path, task_id="T-1")
+        await backend.generate(request)
+
+        forwarded = delegate.generate.call_args[0][0]
+        assert forwarded.execution_endpoint == "openai-video"
+        assert request.execution_endpoint is None
 
     @pytest.mark.unit
     def test_video_capabilities_for_tier_delegates_when_delegate_supports_it(self):
@@ -254,6 +285,7 @@ class TestCustomVideoBackend:
 
 
 class TestCustomAudioBackend:
+    @pytest.mark.unit
     def test_properties(self):
         delegate = AsyncMock()
         delegate.capabilities = {AudioCapability.TEXT_TO_SPEECH}
@@ -263,6 +295,7 @@ class TestCustomAudioBackend:
         assert backend.model == "tts-1"
         assert backend.capabilities == {AudioCapability.TEXT_TO_SPEECH}
 
+    @pytest.mark.unit
     def test_capabilities_delegated(self):
         delegate = AsyncMock()
         delegate.capabilities = {AudioCapability.TEXT_TO_SPEECH}
@@ -270,6 +303,7 @@ class TestCustomAudioBackend:
 
         assert backend.capabilities is delegate.capabilities
 
+    @pytest.mark.unit
     async def test_synthesize_delegates(self, tmp_path: Path):
         output_path = tmp_path / "out.wav"
         expected_result = AudioSynthesisResult(
@@ -289,6 +323,7 @@ class TestCustomAudioBackend:
         assert result is expected_result
         delegate.synthesize.assert_awaited_once_with(request)
 
+    @pytest.mark.unit
     def test_list_voices_delegates(self):
         from lib.audio_backends.base import VoiceOption
 
@@ -300,6 +335,7 @@ class TestCustomAudioBackend:
         assert backend.list_voices() is expected_voices
         delegate.list_voices.assert_called_once_with()
 
+    @pytest.mark.unit
     async def test_synthesize_passes_request_unchanged(self, tmp_path: Path):
         output_path = tmp_path / "seg.wav"
         delegate = AsyncMock()

@@ -80,20 +80,6 @@ def reference_project(tmp_path: Path) -> Path:
 
 @pytest.mark.asyncio
 @pytest.mark.integration
-async def test_script_generator_build_prompt_selects_reference_branch(reference_project: Path):
-    """当 generation_mode == reference_video 时，build_prompt 必须走 reference 分支。"""
-    gen = ScriptGenerator(reference_project)
-    prompt = await gen.build_prompt(episode=1)
-    # reference 分支特征标签
-    assert "视觉展开" in prompt
-    assert "<step1_units>" in prompt
-    assert "@[名称]" in prompt
-    # 不应出现 narration / drama 特征
-    assert "characters_in_segment" not in prompt
-
-
-@pytest.mark.asyncio
-@pytest.mark.integration
 async def test_script_generator_reads_step1_reference_units(reference_project: Path):
     gen = ScriptGenerator(reference_project)
     prompt = await gen.build_prompt(episode=1)
@@ -403,6 +389,7 @@ async def test_script_generator_rejects_step2_unregistered_mention(reference_pro
         await gen.generate(episode=1)
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_script_generator_reference_branch_inherits_drama_content_mode(tmp_path: Path):
     """drama 项目下生成的参考视频集 content_mode 必须为 drama。
@@ -441,6 +428,7 @@ async def test_script_generator_reference_branch_inherits_drama_content_mode(tmp
     assert "generation_mode" not in data
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "caps, expected",
     [
@@ -475,6 +463,7 @@ def test_resolve_max_refs_from_caps(tmp_path: Path, caps, expected):
     assert gen._resolve_max_refs(caps) == expected
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "video_backend, expected",
     [
@@ -511,6 +500,7 @@ def test_resolve_max_refs_from_registry_fallback(tmp_path: Path, video_backend, 
     assert gen._resolve_max_refs(None) == expected
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_build_prompt_no_video_backend_raises_value_error(tmp_path: Path):
     """project.json 缺 video_backend 且 caps 不可解析时，build_prompt 应抛 ValueError。
@@ -553,6 +543,7 @@ async def test_build_prompt_no_video_backend_raises_value_error(tmp_path: Path):
             await gen.build_prompt(episode=1)
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_fetch_video_capabilities_swallows_db_errors(reference_project: Path):
     """CI 回归：裸测试容器缺 migration 时 ConfigResolver 会抛 OperationalError；
@@ -567,6 +558,7 @@ async def test_fetch_video_capabilities_swallows_db_errors(reference_project: Pa
     assert caps is None
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_build_prompt_follows_project_reference_route(tmp_path: Path):
     """项目路线为 reference_video 时 build_prompt 必须走 reference 分支。
@@ -601,10 +593,7 @@ async def test_build_prompt_follows_project_reference_route(tmp_path: Path):
 
     gen = ScriptGenerator(project_dir)
     prompt = await gen.build_prompt(episode=1)
-    # 走 reference 分支：step2 视觉展开模板
-    assert "视觉展开" in prompt
-    assert "<step1_units>" in prompt
-    assert "@[名称]" in prompt
+    assert "@[主角] 推开 @[酒馆] 的门" in prompt
 
 
 @pytest.mark.asyncio
@@ -623,6 +612,7 @@ async def test_script_generator_reads_legacy_step1_draft_without_source_text(ref
     assert _json.loads(out.read_text(encoding="utf-8"))["video_units"][0]["unit_id"] == "E1U01"
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reference_step1_legacy_md_prompts_resplit(reference_project: Path):
     """仅存在结构化前的旧 .md 拆分表时，给出明确的「重跑拆分」提示而非笼统缺文件错误。"""
@@ -635,6 +625,7 @@ async def test_reference_step1_legacy_md_prompts_resplit(reference_project: Path
         await gen.build_prompt(episode=1)
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reference_step1_missing_raises(reference_project: Path):
     drafts = reference_project / "drafts" / "episode_1"
@@ -645,6 +636,7 @@ async def test_reference_step1_missing_raises(reference_project: Path):
         await gen.build_prompt(episode=1)
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reference_step1_rejects_out_of_enum_duration(reference_project: Path):
     """读取侧复验 unit 时长 ∈ supported_durations，防手工编辑漂移出非法时长。"""
@@ -664,6 +656,7 @@ async def test_reference_step1_rejects_out_of_enum_duration(reference_project: P
             await gen.build_prompt(episode=1)
 
 
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_reference_step1_rejects_duplicate_unit_ids(reference_project: Path):
     drafts = reference_project / "drafts" / "episode_1"

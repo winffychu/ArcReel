@@ -13,6 +13,7 @@ from typing import Any
 
 from claude_agent_sdk import tool
 
+from lib.config.resolver import VideoCapability
 from lib.generation_queue_client import (
     BatchTaskResult,
     TaskSpec,
@@ -33,6 +34,7 @@ from lib.reference_video.ad_units import (
     resolve_ad_unit_shots,
     sync_ad_reference_units,
 )
+from lib.reference_video.units import reference_unit_video_bucket
 from lib.script_models import get_generated_assets, resolve_content_mode
 from lib.script_skeleton import ensure_route_skeleton
 from lib.storyboard_sequence import get_storyboard_items, resolve_storyboard_image_ref
@@ -47,7 +49,7 @@ from server.services.reference_video_tasks import (
     resolve_max_unit_duration,
     resolve_project_duration_context,
 )
-from server.services.video_caps import resolve_project_voice_consistency
+from server.services.video_caps import resolve_project_is_silent
 
 _CONFIRM_DURATION_SCHEMA_PROPERTY = {
     "type": "boolean",
@@ -93,8 +95,9 @@ async def _pending_duration_confirmations(
 ) -> list[dict[str, Any]]:
     """收集本批将入队的 unit 中，申请时长与剧本编排不一致的清单。
 
-    项目视频能力（档位 + 分辨率）至多解析一次（:func:`resolve_project_duration_context`），
-    批内逐 unit 取档改用纯函数 :func:`precheck_unit`——避免整批 N 个 unit 各自触发一轮
+    项目视频能力（档位 + 分辨率）按能力桶至多各解析一次（:func:`resolve_project_duration_context`；
+    unit 按声明的参考集分桶——无参考图退化镜头按 i2v 桶模型取档，与执行侧同口径），批内
+    逐 unit 取档改用纯函数 :func:`precheck_unit`——避免整批 N 个 unit 各自触发一轮
     DB 往返。解析推迟到第一个真正需要取档的 unit：整批都已完成或都被跳过时不触发任何 IO。
 
     悬空索引 / 结构异常 / 空提示词的 unit 在此复用与 ``build_specs`` 同一份 spec 构造
@@ -102,7 +105,7 @@ async def _pending_duration_confirmations(
     ``build_specs`` 阶段本就会拒绝，若仍纳入确认清单或触发 ctx 解析，会让批次卡在一个
     注定不会入队的 unit 上，且申请时长的转述本身就是失实的（该 unit 根本不会被生成）。
     """
-    ctx: ProjectDurationContext | None = None
+    ctxs: dict[VideoCapability, ProjectDurationContext] = {}
     items: list[dict[str, Any]] = []
     for unit in units:
         unit_id = str(unit.get("unit_id") or "")
@@ -116,10 +119,11 @@ async def _pending_duration_confirmations(
             ad_shots = ad_shots_for(unit) if ad_shots_for else None
         except ValueError:
             continue
-        if ctx is None:
-            ctx = await resolve_project_duration_context(project)
+        bucket = reference_unit_video_bucket(unit)
+        if bucket not in ctxs:
+            ctxs[bucket] = await resolve_project_duration_context(project, capability=bucket)
         try:
-            slot = precheck_unit(ctx, unit, ad_shots)
+            slot = precheck_unit(ctxs[bucket], unit, ad_shots)
         except ValueError:
             continue
         if slot.needs_confirmation:
@@ -168,13 +172,13 @@ def _get_video_prompt(
 async def _resolve_voice_characters(ctx: ToolContext, content_mode: str) -> dict[str, Any] | None:
     """供 Voice_Profiles 注入的角色资产；``None`` 表示不注入。
 
-    非 drama 直接返回 None（无需为 narration/ad 项目多付一次视频能力解析），drama 再按
-    声音一致性档位排除 C 类（真无声）模型。
+    非 drama 直接返回 None（无需为 narration/ad 项目多付一次视频能力解析），drama 再按无声
+    判据排除：C 类模型不产音、或本集关闭了音频，两条路径同口径。台词不受影响、照常下发。
     """
     if content_mode != "drama":
         return None
     project = ctx.pm.load_project(ctx.project_name)
-    if await resolve_project_voice_consistency(project) == "none":
+    if await resolve_project_is_silent(project):
         return None
     return project.get("characters") or {}
 
@@ -492,8 +496,8 @@ async def _generate_reference_units(
     算出，narration/drama 不传。
 
     ``reuse_existing`` 决定磁盘上已存在的 ``{unit_id}.mp4`` 能否当作该 unit 的
-    现行产物复用（None 表示仅凭文件存在即复用）。ad 派生索引在成员/参考集变化
-    时会重置 unit 的 generated_assets，同名旧文件已不可信，须由该判定排除。
+    现行产物复用（None 表示仅凭文件存在即复用）。ad 按 generated_assets 是否仍
+    指向成片判定：指针为空的孤儿同名文件不可信，须由该判定排除。
 
     ``confirm_duration`` 为 false 时，若待入队 unit 中有申请时长与剧本编排不一致的
     （见 :func:`server.services.reference_video_tasks.resolve_duration_slot`），本次
@@ -615,8 +619,9 @@ async def _run_ad_reference_episode(
 ) -> dict[str, Any]:
     """ad + reference_video：先（重新）派生分组索引并持久化，再按 unit 批量直出。
 
-    分组是纯函数派生（shots + 供应商时长上限 → 可复现分组）；成员与参考集未变
-    的 unit 保留 generated_assets，已有产物经磁盘扫描跳过重复入队。
+    分组是纯函数派生（shots + 供应商时长上限 → 可复现分组）；generated_assets
+    按 unit_id 沿用，已有产物经磁盘扫描跳过重复入队；成员/参考集偏离产物的
+    unit 携带 stale 位并透出清单，不自动重生成。
     """
     project = ctx.pm.load_project(ctx.project_name)
     max_unit_duration = await resolve_max_unit_duration(project)
@@ -631,6 +636,11 @@ async def _run_ad_reference_episode(
     if not units:
         raise ValueError(f"剧本没有可分组的镜头：{script_filename}")
     log.append(f"已派生 {len(units)} 个 video_unit（连续镜头分组，索引已写入剧本）")
+    # stale 清单透出给调用方：这些 unit 的成片仍有效并按现有产物复用，不自动重生成；
+    # 是否重生成由用户/智能体决定（单元级重生成入口会在成功后清除 stale）。
+    stale_ids = [str(u.get("unit_id")) for u in units if u.get("stale")]
+    if stale_ids:
+        log.append(f"⚠️  以下 unit 的剧本已变更但保留既有成片（stale），如需更新请重新生成：{', '.join(stale_ids)}")
 
     style = project.get("style")
     result = await _generate_reference_units(
@@ -652,8 +662,9 @@ async def _run_ad_reference_episode(
         ),
         project=project,
         confirm_duration=confirm_duration,
-        # sync 把成员/参考集变化的 unit 重置为待生成；旧同名产物不可复用，
-        # 仅 generated_assets 仍指向产物的 unit 才按磁盘文件跳过
+        # 剧本编辑不作废产物：有成片指针的 unit（含 stale）一律按现有产物复用，
+        # 不自动重生成——stale 清单已透出，是否重生成由用户/智能体决定。
+        # 指针为空的孤儿同名文件不可信，不复用。
         reuse_existing=lambda u: bool(get_generated_assets(u).get("video_clip")),
         ad_shots_for=lambda u: resolve_ad_unit_shots(script, u),
     )

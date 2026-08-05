@@ -14,6 +14,7 @@ from server.auth import CurrentUserInfo, get_current_user
 from server.error_handlers import register_error_handlers
 from server.routers import script_review as router_mod
 from tests.auth_deps import AUTH_DEPENDENCIES
+from tests.fakes import fake_reference_caps_fetcher
 
 
 def _drama_step1() -> dict:
@@ -82,6 +83,7 @@ def _write_rv_step1(pm: ProjectManager, content: dict) -> None:
 
 
 class TestScriptReviewRouter:
+    @pytest.mark.unit
     def test_full_gate_flow(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
         with client:
@@ -110,6 +112,7 @@ class TestScriptReviewRouter:
             assert confirmed.json()["status"] == "confirmed"
             assert script_review.gate_blocks_step2(pm.get_project_path("demo"), pm.load_project("demo"), 1) is False
 
+    @pytest.mark.unit
     def test_edit_content_repends(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
         with client:
@@ -126,6 +129,7 @@ class TestScriptReviewRouter:
             got = client.get(base)
             assert got.json()["content"]["scenes"][0]["utterances"][1]["text"] == "你怎么才回来。"
 
+    @pytest.mark.unit
     def test_put_invalid_content_422(self, tmp_path, monkeypatch):
         client, pm = _client(monkeypatch, tmp_path)
         with client:
@@ -136,6 +140,7 @@ class TestScriptReviewRouter:
             put = client.put(f"{base}/content", json=bad)
             assert put.status_code == 422
 
+    @pytest.mark.unit
     def test_confirm_without_step1_409(self, tmp_path, monkeypatch):
         client, _ = _client(monkeypatch, tmp_path)
         with client:
@@ -143,6 +148,7 @@ class TestScriptReviewRouter:
             confirmed = client.post(f"{base}/confirm")
             assert confirmed.status_code == 409
 
+    @pytest.mark.unit
     def test_get_unregistered_episode_404(self, tmp_path, monkeypatch):
         """未在 project.json 登记的分集 → GET 返回 404，而非误报 no_step1 的 200。"""
         client, _ = _client(monkeypatch, tmp_path)
@@ -152,6 +158,7 @@ class TestScriptReviewRouter:
 
 
 class TestReferenceVideoRouter:
+    @pytest.mark.unit
     def test_full_gate_flow(self, tmp_path, monkeypatch):
         """rv 走同一 HTTP gate：结构化 units 可读、可编辑、web 确认放行 step2（与 web 确认等价）。"""
         from lib import script_review
@@ -183,6 +190,7 @@ class TestReferenceVideoRouter:
             assert confirmed.json()["status"] == "confirmed"
             assert script_review.gate_blocks_step2(pm.get_project_path("demo"), pm.load_project("demo"), 1) is False
 
+    @pytest.mark.unit
     def test_quarantine_surfaced_with_recomputed_line_anchored_violations(self, tmp_path, monkeypatch):
         """隔离草稿在场时 GET 附带 ``quarantine`` 字段：违约按产出时那套校验器读时重算，
         不信任草稿里上一轮的快照（这里把快照消息故意写成 "stale" 来验证）。"""
@@ -196,18 +204,7 @@ class TestReferenceVideoRouter:
         (project_path / "source").mkdir(parents=True, exist_ok=True)
         (project_path / "source" / "episode_1.txt").write_text(novel, encoding="utf-8")
 
-        async def _fake_caps(_project, _episode=None):
-            return mod.ReferenceSplitCaps(
-                default_duration=4,
-                durations=[4, 6, 8],
-                reference_durations=[4, 6, 8],
-                text_durations=[4, 6, 8],
-                max_duration=8,
-                max_refs=3,
-                raw={},
-            )
-
-        monkeypatch.setattr(mod, "_fetch_reference_caps_with_fallback", _fake_caps)
+        monkeypatch.setattr(mod, "_fetch_reference_caps_with_fallback", fake_reference_caps_fetcher(max_duration=8))
 
         flat_units = [{"duration_seconds": 4, "source_text": novel, "text": "镜头1：门开了\n@[阿离]：｛我来了。｝"}]
         write_quarantine(
@@ -234,6 +231,7 @@ class TestReferenceVideoRouter:
             confirmed = client.post(f"{base}/confirm")
             assert confirmed.status_code == 409
 
+    @pytest.mark.unit
     def test_quarantine_schema_invalid_keeps_raw_content(self, tmp_path, monkeypatch):
         """草稿 units 被改成非数组：违约报 schema_invalid，``content`` 原样回传（不做收编），
         呈现层据此退回原始文本视图而非当作 units 列表遍历。"""
@@ -246,18 +244,7 @@ class TestReferenceVideoRouter:
         (project_path / "source").mkdir(parents=True, exist_ok=True)
         (project_path / "source" / "episode_1.txt").write_text("阿离站在屋檐下。", encoding="utf-8")
 
-        async def _fake_caps(_project, _episode=None):
-            return mod.ReferenceSplitCaps(
-                default_duration=4,
-                durations=[4, 6, 8],
-                reference_durations=[4, 6, 8],
-                text_durations=[4, 6, 8],
-                max_duration=8,
-                max_refs=3,
-                raw={},
-            )
-
-        monkeypatch.setattr(mod, "_fetch_reference_caps_with_fallback", _fake_caps)
+        monkeypatch.setattr(mod, "_fetch_reference_caps_with_fallback", fake_reference_caps_fetcher(max_duration=8))
         write_quarantine(
             project_path,
             1,
@@ -274,6 +261,7 @@ class TestReferenceVideoRouter:
             assert [v["code"] for v in quarantine["violations"]] == ["schema_invalid"]
             assert quarantine["violations"][0]["message"] != "stale"
 
+    @pytest.mark.unit
     def test_quarantine_meta_broken_reports_recompute_failure_not_snapshot(self, tmp_path, monkeypatch):
         """``meta.source`` 缺失 → 无从重算：报「无法重算」本身，而不是退回草稿里那份上一轮
         快照——报告一律对现值负责。"""
@@ -297,6 +285,7 @@ class TestReferenceVideoRouter:
             assert "stale" not in violations[0]["message"]
             assert violations[0]["label"] == ""
 
+    @pytest.mark.unit
     def test_supported_durations_exposed_for_reference_video_only(self, tmp_path, monkeypatch):
         """rv 变体的 GET 带出档位表供 web 渲染时长选择；drama 变体下为 None。"""
         rv_client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
@@ -430,6 +419,7 @@ class TestReferenceVideoRouter:
         （收窄后的逐 unit 可选项）都要经 caps 解析出真实档位，否则这类项目的审阅门只能退回
         结构区间 clamp，读时迁移的收编对其整体失效。
         """
+        from server.agent_runtime.sdk_tools import _context
         from server.services import script_review as mod
 
         client, pm = _client(monkeypatch, tmp_path, generation_mode="reference_video")
@@ -438,6 +428,11 @@ class TestReferenceVideoRouter:
             return {"provider_id": "custom-acme", "model": "acme-video", "supported_durations": [5, 10]}
 
         monkeypatch.setattr(mod, "resolve_video_caps", _fake_caps)
+
+        async def _no_i2v(_project, *, capability=None):
+            raise ValueError("i2v bucket unresolvable in this test")
+
+        monkeypatch.setattr(_context, "resolve_video_caps", _no_i2v)
 
         with client:
             _write_rv_step1(pm, _rv_step1())
@@ -525,6 +520,7 @@ class TestReferenceVideoRouter:
             codes = [v["code"] for v in put_body["quarantine"]["violations"]]
             assert codes and "quarantine_unreadable" not in codes
 
+    @pytest.mark.unit
     def test_put_with_stale_base_fingerprint_conflicts_409(self, tmp_path, monkeypatch):
         """PUT 携带的 ``base_fingerprint`` 与盘上现值不一致（编辑期间另一方已保存）→ 409、
         不落盘；拿最新指纹重试放行。缺省不带指纹的调用维持原语义（不比对）。"""

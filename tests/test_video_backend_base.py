@@ -22,6 +22,8 @@ from lib.video_backends.base import (
     submit_post,
 )
 
+pytestmark = pytest.mark.unit
+
 
 def _http_status_error(status_code: int, *, text: str = "boom") -> httpx.HTTPStatusError:
     """构造真实 httpx.HTTPStatusError；URL 故意含 "503" 子串以验证不再走字符串误判。"""
@@ -457,7 +459,7 @@ class TestPersistJobIdRetry:
                 raise _make_operational_error("database is locked")
 
         class _FakeQueue:
-            async def persist_provider_job_id(self, tid: str, job_id: str) -> None:
+            async def persist_provider_job_id(self, tid: str, job_id: str, *, endpoint: str | None = None) -> None:
                 await _flaky_persist(tid, job_id)
 
         fake_queue = _FakeQueue()
@@ -479,7 +481,7 @@ class TestPersistJobIdRetry:
             raise _make_operational_error("database is locked")
 
         class _FailingQueue:
-            async def persist_provider_job_id(self, tid: str, job_id: str) -> None:
+            async def persist_provider_job_id(self, tid: str, job_id: str, *, endpoint: str | None = None) -> None:
                 await _always_fail(tid, job_id)
 
         fake_queue = _FailingQueue()
@@ -509,7 +511,7 @@ class TestPersistJobIdRetry:
             raise ValueError("not retryable")
 
         class _BadQueue:
-            async def persist_provider_job_id(self, tid: str, job_id: str) -> None:
+            async def persist_provider_job_id(self, tid: str, job_id: str, *, endpoint: str | None = None) -> None:
                 await _bad(tid, job_id)
 
         fake_queue = _BadQueue()
@@ -538,7 +540,7 @@ class TestPersistJobIdRetry:
             raise ValueError("Connection timed out: rate limited at upstream")
 
         class _BadQueue:
-            async def persist_provider_job_id(self, tid: str, job_id: str) -> None:
+            async def persist_provider_job_id(self, tid: str, job_id: str, *, endpoint: str | None = None) -> None:
                 await _bad(tid, job_id)
 
         fake_queue = _BadQueue()
@@ -569,7 +571,15 @@ class TestProviderJobIdPersistenceMixin:
             await self._backend()._persist_provider_job_id(
                 self._request(task_id="local-task-1"), "job-1", provider="ark"
             )
-        persist.assert_awaited_once_with("local-task-1", "job-1", provider="ark")
+        persist.assert_awaited_once_with("local-task-1", "job-1", provider="ark", endpoint=None)
+
+    async def test_worker_path_persists_execution_endpoint(self):
+        """自定义供应商包装层注入的 endpoint 与 job_id 一并落库，供续跑比对协议是否被换掉。"""
+        request = self._request(task_id="local-task-1")
+        request.execution_endpoint = "openai-video"
+        with patch("lib.video_backends.base.persist_provider_job_id", new=AsyncMock()) as persist:
+            await self._backend()._persist_provider_job_id(request, "job-1", provider="ark")
+        persist.assert_awaited_once_with("local-task-1", "job-1", provider="ark", endpoint="openai-video")
 
     async def test_non_worker_path_skips_persist(self):
         """非 worker 路径（grid / 直生 / 测试，task_id=None）跳过持久化，不触碰 DB。"""
