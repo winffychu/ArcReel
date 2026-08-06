@@ -47,7 +47,7 @@ bash .agents/skills/pr-ai-review-loop/scripts/query.sh <PR_NUMBER> <子命令>
 
 | 缺口 | 动作 |
 |---|---|
-| `checks_failing` 非空(CI 红) | 就地修复并 push——CI 红会阻塞 reviewer 触发;修不动(重试仍红 / 根因在 main)才暂停询问 |
+| `checks_failing` 非空(CI 红) | 就地修复并 push——CI 红会阻塞 reviewer 触发。若根因是 main 上的问题且修复已合入,rebase 到最新 main 后 `git push --force-with-lease` 即可拿到修复——`gh run rerun` 只在原 merge-ref 上重跑,不包含 main 的新提交,而 rebase 改写了 commit,普通 push 会被拒;已 rebase 到最新 main 仍红即属修不动,暂停询问 |
 | 某家参审 reviewer 未审当前 HEAD | 按 reviewers.md 该家「触发」规则决定等待或发触发命令 |
 | 至少一家有本轮新 actionable 评论(判定见 reviewers.md) | 进入步骤 3 |
 | `security_alerts.open_introduced` 与已认定误报在案清单(核对方式见 reviewers.md「已知误报」)的差集非空,且该差集无对应新评论 | 上一轮没修干净(bot 不重复提醒)——只把差集里的 alert 数据(number / rule / path / url)带入步骤 3,按数据修而非按评论修;已在案的部分不重复处理。前提:CodeQL 分析完成且成功(门槛 1 口径)——分析未完成时差集基于过期数据,归入下行等待 |
@@ -65,7 +65,7 @@ bash .agents/skills/pr-ai-review-loop/scripts/query.sh <PR_NUMBER> <子命令>
 
 GitHub code scanning 两家(quality / security)的评论并入同一批,处置口径(全部 actionable、修复与 pushback 落点)见 reviewers.md「GitHub code scanning bots」节。
 
-**修复形状**:下面两条与 `receiving-code-review` 逐条实施的要求冲突时以本节为准——逐条实施会把一批意见变成一批分散的小改动,累积下来持续降低代码的可修改性(ETC)。
+**修复形状**:下面两条与 `receiving-code-review` 逐条实施的要求冲突时以本节为准——逐条实施会把一批意见变成一批分散的小补丁,累积下来持续降低代码的可修改性(ETC);修复取「回到合理形态」的最小改动,不在现状上叠补丁。
 
 - **YAGNI**:对防御性意见(新增检查、兜底、try-except、默认值、空值分支),先确认它要防的失败路径是否真实存在,即能否指出一个具体的调用方或输入触发它。能指出就实施;不能指出就回复评论说明理由,不修改代码。两种处置都要用一句话记录这条路径:驳回的写在回复评论里,实施的写在 commit 说明里。`receiving-code-review` 的 `YAGNI Check` 一节检查的是静态未被调用的代码,这里检查的是运行时不可达的分支
 - **Duplicated Code**:先确认这批意见中有几条指向同一处逻辑或同一个根因。有两条以上时,在已有抽象内合并为一处改动
